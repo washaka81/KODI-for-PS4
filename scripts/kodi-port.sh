@@ -189,6 +189,7 @@ run_check() {
   local base="$1"
   local keep="$2"
   local tmp
+  mkdir -p "$REPO_ROOT/build"
   tmp="$(mktemp -d "$REPO_ROOT/build/kodi-port-check.XXXXXX")"
   CHECK_WORKTREE="$tmp"
 

@@ -28,6 +28,7 @@ die() {
 
 [[ -d "$BUILD_DIR" ]] || die "build tree $BUILD_DIR does not exist"
 [[ -x "$TOOLCHAIN/bin/linux/create-fself" ]] || die "PS4 toolchain not found"
+mkdir -p "$REPO_ROOT/build"
 
 log "1/5 applying and verifying port/ on src/kodi"
 "$REPO_ROOT/scripts/kodi-port.sh" apply
