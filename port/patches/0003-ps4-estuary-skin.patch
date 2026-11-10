@@ -1,0 +1,446 @@
+diff --git a/addons/skin.estuary/xml/Home.xml b/addons/skin.estuary/xml/Home.xml
+index 25da58c2f5..61fe89c48a 100644
+--- a/addons/skin.estuary/xml/Home.xml
++++ b/addons/skin.estuary/xml/Home.xml
+@@ -24,9 +24,9 @@
+ 			<aspectratio>scale</aspectratio>
+ 			<fadetime>600</fadetime>
+ 			<animation effect="zoom" center="auto" end="102,102" time="0" condition="Integer.IsGreater(System.StereoscopicMode,0)">conditional</animation>
+-			<animation effect="fade" start="0" end="100" time="400">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300">WindowClose</animation>
+-			<animation effect="fade" time="400">VisibleChange</animation>
++			<animation effect="fade" start="0" end="100" time="200">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150">WindowClose</animation>
++			<animation effect="fade" time="200">VisibleChange</animation>
+ 			<imagepath background="true" colordiffuse="bg_overlay">$VAR[HomeFanartVar]</imagepath>
+ 			<visible>!Player.HasMedia</visible>
+ 		</control>
+diff --git a/addons/skin.estuary/xml/Includes.xml b/addons/skin.estuary/xml/Includes.xml
+index d7c6bc8817..d43770fafa 100644
+--- a/addons/skin.estuary/xml/Includes.xml
++++ b/addons/skin.estuary/xml/Includes.xml
+@@ -35,7 +35,7 @@
+ 			<control type="group">
+ 				<animation effect="fade" start="100" end="0" time="150">WindowClose</animation>
+ 				<animation effect="fade" start="100" end="0" time="200" tween="sine" condition="System.HasActiveModalDialog">Conditional</animation>
+-				<animation effect="fade" start="0" end="100" delay="300" time="320">WindowOpen</animation>
++				<animation effect="fade" start="0" end="100" delay="150" time="160">WindowOpen</animation>
+ 				<control type="group">
+ 					<right>0</right>
+ 					<top>list_top_offset</top>
+@@ -747,7 +747,7 @@
+ 			<control type="grouplist">
+ 				<left>20</left>
+ 				<top>5</top>
+-				<animation effect="fade" start="0" end="100" time="300">WindowOpen</animation>
++				<animation effect="fade" start="0" end="100" time="150">WindowOpen</animation>
+ 				<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
+ 				<width>1400</width>
+ 				<height>80</height>
+@@ -781,7 +781,7 @@
+ 				<left>100</left>
+ 				<right>100</right>
+ 				<top>$PARAM[posy]</top>
+-				<animation effect="fade" start="0" end="100" time="300" delay="300">WindowOpen</animation>
++				<animation effect="fade" start="0" end="100" time="150" delay="150">WindowOpen</animation>
+ 				<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
+ 				<height>150</height>
+ 				<itemgap>0</itemgap>
+@@ -821,7 +821,7 @@
+ 				<texturefocus colordiffuse="button_focus">overlays/arrowdown.png</texturefocus>
+ 				<texturenofocus colordiffuse="button_focus">overlays/arrowdown.png</texturenofocus>
+ 				<animation effect="zoom" start="100,0" end="100,100" center="auto" time="200" delay="10">VisibleChange</animation>
+-				<animation effect="zoom" start="100,0" end="100,100" delay="500" center="auto" time="200">WindowOpen</animation>
++				<animation effect="zoom" start="100,0" end="100,100" delay="250" center="auto" time="200">WindowOpen</animation>
+ 				<animation effect="zoom" start="100,100" end="100,0" center="auto" time="200">WindowClose</animation>
+ 				<onclick>SetFocus($PARAM[container_id])</onclick>
+ 				<onclick>PageDown</onclick>
+@@ -836,7 +836,7 @@
+ 				<texturefocus colordiffuse="button_focus" flipy="true">overlays/arrowdown.png</texturefocus>
+ 				<texturenofocus colordiffuse="button_focus" flipy="true">overlays/arrowdown.png</texturenofocus>
+ 				<animation effect="zoom" start="100,0" end="100,100" center="auto" time="200" delay="10">VisibleChange</animation>
+-				<animation effect="zoom" start="100,0" end="100,100" delay="500" center="auto" time="200">WindowOpen</animation>
++				<animation effect="zoom" start="100,0" end="100,100" delay="250" center="auto" time="200">WindowOpen</animation>
+ 				<animation effect="zoom" start="100,100" end="100,0" center="auto" time="200">WindowClose</animation>
+ 				<onclick>SetFocus($PARAM[container_id])</onclick>
+ 				<onclick>PageUp</onclick>
+@@ -858,7 +858,7 @@
+ 				<height>28</height>
+ 				<texture flipx="true" colordiffuse="button_focus">overlays/arrowright.png</texture>
+ 				<animation effect="zoom" start="0,100" end="100,100" center="auto" time="200">VisibleChange</animation>
+-				<animation effect="zoom" start="0,100" end="100,100" delay="500" center="auto" time="200">WindowOpen</animation>
++				<animation effect="zoom" start="0,100" end="100,100" delay="250" center="auto" time="200">WindowOpen</animation>
+ 				<animation effect="zoom" start="100,100" end="0,100" center="auto" time="200">WindowClose</animation>
+ 				<visible>Control.IsVisible($PARAM[list_id]) + Container($PARAM[list_id]).HasPrevious</visible>
+ 				<visible>$PARAM[visible]</visible>
+@@ -870,7 +870,7 @@
+ 				<height>28</height>
+ 				<texture colordiffuse="button_focus">overlays/arrowright.png</texture>
+ 				<animation effect="zoom" start="0,100" end="100,100" center="auto" time="200">VisibleChange</animation>
+-				<animation effect="zoom" start="0,100" end="100,100" delay="500" center="auto" time="200">WindowOpen</animation>
++				<animation effect="zoom" start="0,100" end="100,100" delay="250" center="auto" time="200">WindowOpen</animation>
+ 				<animation effect="zoom" start="100,100" end="0,100" center="auto" time="200">WindowClose</animation>
+ 				<visible>Control.IsVisible($PARAM[list_id]) + Container($PARAM[list_id]).HasNext</visible>
+ 				<visible>$PARAM[visible]</visible>
+@@ -904,7 +904,7 @@
+ 			<width>6000</width>
+ 			<height>6000</height>
+ 			<animation effect="fade" time="300">VisibleChange</animation>
+-			<animation effect="fade" start="0" end="100" time="300">WindowOpen</animation>
++			<animation effect="fade" start="0" end="100" time="150">WindowOpen</animation>
+ 			<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
+ 			<texture colordiffuse="80FFFFFF">colors/black.png</texture>
+ 			<visible>$PARAM[darken_bg]</visible>
+@@ -998,14 +998,14 @@
+ 			<control type="group">
+ 				<animation effect="slide" end="0,-112" time="300" tween="sine" easing="inout" condition="$EXP[infodialog_active]">conditional</animation>
+ 				<depth>DepthBars</depth>
+-				<animation effect="fade" start="0" end="100" time="300" condition="[Window.Previous(fullscreenvideo) | Window.Previous(startup)] + !Window.IsVisible(1109)">WindowOpen</animation>
++				<animation effect="fade" start="0" end="100" time="150" condition="[Window.Previous(fullscreenvideo) | Window.Previous(startup)] + !Window.IsVisible(1109)">WindowOpen</animation>
+ 				<control type="image">
+ 					<left>0</left>
+ 					<top>0</top>
+ 					<width>110%</width>
+ 					<height>130</height>
+ 					<texture>frame/InfoBar.png</texture>
+-					<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(screencalibration)">WindowClose</animation>
++					<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(screencalibration)">WindowClose</animation>
+ 				</control>
+ 				<control type="grouplist">
+ 					<width>900</width>
+@@ -1038,7 +1038,7 @@
+ 					<shadowcolor>text_shadow</shadowcolor>
+ 					<height>100</height>
+ 					<width>900</width>
+-					<animation effect="fade" start="0" end="100" time="300">WindowOpen</animation>
++					<animation effect="fade" start="0" end="100" time="150">WindowOpen</animation>
+ 					<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
+ 					<animation effect="slide" end="70,0" time="200" reversible="true" condition="Control.IsVisible(799)">Conditional</animation>
+ 				</control>
+@@ -1101,7 +1101,7 @@
+ 							<left>-70</left>
+ 							<width>50</width>
+ 							<height>50</height>
+-							<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(screencalibration)">WindowClose</animation>
++							<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(screencalibration)">WindowClose</animation>
+ 							<texture>$INFO[System.ProfileThumb]</texture>
+ 							<aspectratio>scale</aspectratio>
+ 						</control>
+@@ -1114,7 +1114,7 @@
+ 							<aligny>center</aligny>
+ 							<height>110</height>
+ 							<width max="600">auto</width>
+-							<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(screencalibration)">WindowClose</animation>
++							<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(screencalibration)">WindowClose</animation>
+ 							<label>$INFO[System.ProfileName]</label>
+ 						</control>
+ 					</control>
+@@ -1123,7 +1123,7 @@
+ 						<shadowcolor>text_shadow</shadowcolor>
+ 						<height>200</height>
+ 						<width>auto</width>
+-						<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(screencalibration)">WindowClose</animation>
++						<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(screencalibration)">WindowClose</animation>
+ 						<label>$INFO[System.Time]</label>
+ 					</control>
+ 				</control>
+@@ -1208,7 +1208,7 @@
+ 		<height>100</height>
+ 		<orientation>horizontal</orientation>
+ 		<usecontrolcoords>true</usecontrolcoords>
+-		<animation effect="fade" start="0" end="100" time="300">WindowOpen</animation>
++		<animation effect="fade" start="0" end="100" time="150">WindowOpen</animation>
+ 		<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
+ 		<animation effect="slide" end="0,16" time="200" reversible="true" condition="String.IsEmpty(Control.GetLabel(18900))">Conditional</animation>
+ 		<animation effect="slide" end="70,0" time="200" reversible="true" condition="Control.IsVisible(799)">Conditional</animation>
+@@ -1289,15 +1289,15 @@
+ 				<animation effect="zoom" center="auto" end="102,102" time="0" condition="Integer.IsGreater(System.StereoscopicMode,0)">conditional</animation>
+ 				<control type="group">
+ 					<animation effect="fade" start="100" end="bg_alpha" time="0" condition="!Control.IsVisible(31111)">Conditional</animation>
+-					<animation effect="fade" start="0" end="100" time="300" condition="Window.Previous(fullscreenvideo) | Window.Previous(FullscreenGame) | Window.Previous(startup)">WindowOpen</animation>
++					<animation effect="fade" start="0" end="100" time="150" condition="Window.Previous(fullscreenvideo) | Window.Previous(FullscreenGame) | Window.Previous(startup)">WindowOpen</animation>
+ 					<include>ColoredBackgroundImages</include>
+ 				</control>
+ 				<control type="group" id="31111">
+ 					<visible>!Window.IsActive(Home) + [![Player.HasVideo | [Player.HasAudio + Visualisation.Enabled + !String.IsEmpty(Visualisation.Name)]] | !String.IsEmpty(Window(Videos).Property(PlayingBackgroundMedia))]</visible>
+ 					<depth>DepthBackground</depth>
+-					<animation effect="fade" start="0" end="100" time="400">WindowOpen</animation>
+-					<animation effect="fade" start="100" end="0" time="300">WindowClose</animation>
+-					<animation effect="fade" time="400">VisibleChange</animation>
++					<animation effect="fade" start="0" end="100" time="200">WindowOpen</animation>
++					<animation effect="fade" start="100" end="0" time="150">WindowClose</animation>
++					<animation effect="fade" time="200">VisibleChange</animation>
+ 					<control type="image" id="32111">
+ 						<include>FullScreenDimensions</include>
+ 						<aspectratio>scale</aspectratio>
+@@ -1328,8 +1328,8 @@
+ 			<control type="group">
+ 				<animation effect="slide" end="0,112" time="300" tween="sine" easing="inout" condition="$EXP[infodialog_active]">conditional</animation>
+ 				<depth>DepthBars</depth>
+-				<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(visualisation) | Window.Next(screencalibration)">WindowClose</animation>
+-				<animation effect="fade" start="0" end="100" time="300" condition="Window.Previous(fullscreenvideo) | Window.Previous(startup) | Window.Previous(visualisation)">WindowOpen</animation>
++				<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(visualisation) | Window.Next(screencalibration)">WindowClose</animation>
++				<animation effect="fade" start="0" end="100" time="150" condition="Window.Previous(fullscreenvideo) | Window.Previous(startup) | Window.Previous(visualisation)">WindowOpen</animation>
+ 				<bottom>0</bottom>
+ 				<control type="image">
+ 					<left>0</left>
+@@ -1343,8 +1343,8 @@
+ 					<visible>!System.HasActiveModalDialog</visible>
+ 					<visible>!Skin.HasSetting(touchmode)</visible>
+ 					<animation effect="fade" time="400">VisibleChange</animation>
+-					<animation effect="fade" start="0" end="100" time="400">WindowOpen</animation>
+-					<animation effect="fade" start="100" end="0" time="300">WindowClose</animation>
++					<animation effect="fade" start="0" end="100" time="200">WindowOpen</animation>
++					<animation effect="fade" start="100" end="0" time="150">WindowClose</animation>
+ 					<control type="button">
+ 						<bottom>20</bottom>
+ 						<left>12</left>
+@@ -1386,8 +1386,8 @@
+ 	</include>
+ 	<include name="BottomBarTwoListInfo">
+ 		<control type="group">
+-			<animation effect="fade" start="0" end="100" time="400">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300">WindowClose</animation>
++			<animation effect="fade" start="0" end="100" time="200">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150">WindowClose</animation>
+ 			<control type="grouplist">
+ 				<orientation>horizontal</orientation>
+ 				<align>right</align>
+@@ -1525,8 +1525,8 @@
+ 			<orientation>horizontal</orientation>
+ 			<visible>Skin.HasSetting(touchmode)</visible>
+ 			<visible>!Window.IsActive(home) + !Window.IsActive(filemanager)</visible>
+-			<animation effect="fade" start="0" end="100" time="400" condition="Window.Previous(home)">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(home)">WindowClose</animation>
++			<animation effect="fade" start="0" end="100" time="200" condition="Window.Previous(home)">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(home)">WindowClose</animation>
+ 			<itemgap>0</itemgap>
+ 			<left>-8</left>
+ 			<width>480</width>
+@@ -1587,8 +1587,8 @@
+ 			<align>center</align>
+ 			<aligny>center</aligny>
+ 			<onclick>Action(Back)</onclick>
+-			<animation effect="fade" start="0" end="100" time="400" condition="Window.Previous(home)">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300" condition="Window.Next(home)">WindowClose</animation>
++			<animation effect="fade" start="0" end="100" time="200" condition="Window.Previous(home)">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150" condition="Window.Next(home)">WindowClose</animation>
+ 			<texturefocus colordiffuse="button_focus">buttons/roundbutton-fo.png</texturefocus>
+ 			<texturenofocus />
+ 			<radioposx>30</radioposx>
+diff --git a/addons/skin.estuary/xml/Includes_Animations.xml b/addons/skin.estuary/xml/Includes_Animations.xml
+index a317b31c9c..727602950f 100644
+--- a/addons/skin.estuary/xml/Includes_Animations.xml
++++ b/addons/skin.estuary/xml/Includes_Animations.xml
+@@ -1,37 +1,37 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <includes>
+ 	<include name="Animation_FocusTextureFade">
+-		<animation effect="fade" start="0" end="100" time="200" tween="sine">Focus</animation>
++		<animation effect="fade" start="0" end="100" time="100" tween="sine">Focus</animation>
+ 		<animation effect="fade" start="100" end="0" time="0">UnFocus</animation>
+ 	</include>
+ 	<include name="Animation_DialogPopupOpenClose">
+ 		<animation type="WindowOpen" reversible="false">
+-			<effect type="zoom" start="80" end="100" center="50%,50%" delay="160" tween="back" time="240" />
+-			<effect type="fade" delay="160" end="100" time="240" />
++			<effect type="zoom" start="80" end="100" center="50%,50%" delay="80" tween="back" time="120" />
++			<effect type="fade" delay="80" end="100" time="120" />
+ 		</animation>
+ 		<animation type="WindowClose" reversible="false">
+-			<effect type="zoom" start="100" end="80" center="50%,50%" easing="in" tween="back" time="240" />
+-			<effect type="fade" start="100" end="0" time="240" />
++			<effect type="zoom" start="100" end="80" center="50%,50%" easing="in" tween="back" time="120" />
++			<effect type="fade" start="100" end="0" time="120" />
+ 		</animation>
+ 		<depth>DepthDialog</depth>
+ 	</include>
+ 	<include name="Animation_DialogPopupVisible">
+ 		<animation type="Visible" reversible="false">
+-			<effect type="zoom" start="80" end="100" center="50%,50%" delay="160" tween="back" time="240" />
+-			<effect type="fade" delay="160" end="100" time="240" />
++			<effect type="zoom" start="80" end="100" center="50%,50%" delay="80" tween="back" time="120" />
++			<effect type="fade" delay="80" end="100" time="120" />
+ 		</animation>
+ 		<animation type="Hidden" reversible="false">
+-			<effect type="zoom" start="100" end="80" center="50%,50%" easing="in" tween="back" time="240" />
+-			<effect type="fade" start="100" end="0" time="240" />
++			<effect type="zoom" start="100" end="80" center="50%,50%" easing="in" tween="back" time="120" />
++			<effect type="fade" start="100" end="0" time="120" />
+ 		</animation>
+ 	</include>
+ 	<include name="Visible_Fade">
+-		<animation effect="fade" end="100" time="200">Visible</animation>
+-		<animation effect="fade" start="100" end="0" time="200">Hidden</animation>
++		<animation effect="fade" end="100" time="100">Visible</animation>
++		<animation effect="fade" start="100" end="0" time="100">Hidden</animation>
+ 	</include>
+ 	<include name="OpenClose_Fade">
+-		<animation effect="fade" end="100" time="200">WindowOpen</animation>
+-		<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
++		<animation effect="fade" end="100" time="100">WindowOpen</animation>
++		<animation effect="fade" start="100" end="0" time="100">WindowClose</animation>
+ 	</include>
+ 	<include name="Visible_Right_Delayed">
+ 		<include condition="Skin.HasSetting(no_slide_animations)">Visible_Fade</include>
+@@ -41,12 +41,12 @@
+ 	</include>
+ 	<include name="Vis_FadeSlide_Right_Delayed">
+ 		<animation type="Conditional" condition="String.IsEqual(Container(9000).ListItem.Property(id),$PARAM[id])">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" delay="300" easing="out" />
+-			<effect type="slide" start="320" end="0" time="400" delay="300" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" delay="150" easing="out" />
++			<effect type="slide" start="320" end="0" time="200" delay="150" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="Hidden">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0" end="320" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0" end="320" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="Visible_Right">
+@@ -55,32 +55,32 @@
+ 	</include>
+ 	<include name="Animation_TopSlide">
+ 		<animation type="WindowOpen" reversible="false">
+-			<effect type="fade" start="0" end="100" time="300"/>
+-			<effect type="slide" start="0,-200" end="0,0" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150"/>
++			<effect type="slide" start="0,-200" end="0,0" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="WindowClose" reversible="false">
+-			<effect type="fade" start="100" end="0" time="300"/>
+-			<effect type="slide" start="0,0" end="0,-200" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150"/>
++			<effect type="slide" start="0,0" end="0,-200" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="Animation_BottomSlide">
+ 		<animation type="WindowOpen" reversible="false">
+-			<effect type="fade" start="0" end="100" time="300"/>
+-			<effect type="slide" start="0,200" end="0,0" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150"/>
++			<effect type="slide" start="0,200" end="0,0" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="WindowClose" reversible="false">
+-			<effect type="fade" start="100" end="0" time="300"/>
+-			<effect type="slide" start="0,0" end="0,200" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150"/>
++			<effect type="slide" start="0,0" end="0,200" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="Vis_FadeSlide_Right">
+ 		<animation type="Visible" reversible="false">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" easing="out"/>
+-			<effect type="slide" start="320" end="0" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" easing="out"/>
++			<effect type="slide" start="320" end="0" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="Hidden" reversible="false">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0" end="320" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0" end="320" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="Visible_Left">
+@@ -89,12 +89,12 @@
+ 	</include>
+ 	<include name="Vis_FadeSlide_Left">
+ 		<animation type="Visible" reversible="false">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="-320" end="0" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="-320" end="0" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="Hidden" reversible="false">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0" end="-320" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0" end="-320" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="OpenClose_Left">
+@@ -103,12 +103,12 @@
+ 	</include>
+ 	<include name="OpenClose_FadeSlide_Left">
+ 		<animation type="WindowOpen">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="-320" end="0" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="-320" end="0" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="WindowClose">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0" end="-320" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0" end="-320" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="OpenClose_Right">
+@@ -117,22 +117,22 @@
+ 	</include>
+ 	<include name="OpenClose_FadeSlide_Right">
+ 		<animation type="WindowOpen">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="320" end="0" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="320" end="0" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="WindowClose">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0" end="320" time="300" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0" end="320" time="150" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ 	<include name="Keyboard_Slide_Up">
+ 		<animation type="WindowOpen">
+-			<effect type="fade" start="0" end="100" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0,1080" end="0,0" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="0" end="100" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0,1080" end="0,0" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 		<animation type="WindowClose">
+-			<effect type="fade" start="100" end="0" time="300" tween="sine" easing="out" />
+-			<effect type="slide" start="0,0" end="0,1080" time="400" tween="cubic" easing="out" />
++			<effect type="fade" start="100" end="0" time="150" tween="sine" easing="out" />
++			<effect type="slide" start="0,0" end="0,1080" time="200" tween="cubic" easing="out" />
+ 		</animation>
+ 	</include>
+ </includes>
+diff --git a/addons/skin.estuary/xml/Settings.xml b/addons/skin.estuary/xml/Settings.xml
+index 8d51703075..9b2526200b 100644
+--- a/addons/skin.estuary/xml/Settings.xml
++++ b/addons/skin.estuary/xml/Settings.xml
+@@ -9,9 +9,9 @@
+ 			<include>FullScreenDimensions</include>
+ 			<aspectratio>scale</aspectratio>
+ 			<animation effect="zoom" center="auto" end="102,102" time="0" condition="Integer.IsGreater(System.StereoscopicMode,0)">conditional</animation>
+-			<animation effect="fade" start="0" end="100" time="400" reversible="true" condition="!Window.Previous(SettingsCategory.xml)">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300" reversible="true" condition="!Window.Next(SettingsCategory.xml)">WindowClose</animation>
+-			<animation effect="fade" time="400">VisibleChange</animation>
++			<animation effect="fade" start="0" end="100" time="200" reversible="true" condition="!Window.Previous(SettingsCategory.xml)">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150" reversible="true" condition="!Window.Next(SettingsCategory.xml)">WindowClose</animation>
++			<animation effect="fade" time="200">VisibleChange</animation>
+ 			<imagepath colordiffuse="35FFFFFF">$INFO[Skin.String(HomeFanart.path)]settings$INFO[Skin.String(HomeFanart.ext)]</imagepath>
+ 			<visible>!Player.HasMedia + !String.IsEmpty(Skin.String(HomeFanart.path))</visible>
+ 		</control>
+diff --git a/addons/skin.estuary/xml/SettingsCategory.xml b/addons/skin.estuary/xml/SettingsCategory.xml
+index cd305a1682..2449aa5494 100644
+--- a/addons/skin.estuary/xml/SettingsCategory.xml
++++ b/addons/skin.estuary/xml/SettingsCategory.xml
+@@ -9,9 +9,9 @@
+ 			<include>FullScreenDimensions</include>
+ 			<aspectratio>scale</aspectratio>
+ 			<animation effect="zoom" center="auto" end="102,102" time="0" condition="Integer.IsGreater(System.StereoscopicMode,0)">conditional</animation>
+-			<animation effect="fade" start="0" end="100" time="400" reversible="true" condition="!Window.Previous(Settings)">WindowOpen</animation>
+-			<animation effect="fade" start="100" end="0" time="300" reversible="true" condition="!Window.Next(Settings)">WindowClose</animation>
+-			<animation effect="fade" time="400">VisibleChange</animation>
++			<animation effect="fade" start="0" end="100" time="200" reversible="true" condition="!Window.Previous(Settings)">WindowOpen</animation>
++			<animation effect="fade" start="100" end="0" time="150" reversible="true" condition="!Window.Next(Settings)">WindowClose</animation>
++			<animation effect="fade" time="200">VisibleChange</animation>
+ 			<imagepath colordiffuse="35FFFFFF">$INFO[Skin.String(HomeFanart.path)]settings$INFO[Skin.String(HomeFanart.ext)]</imagepath>
+ 			<visible>!Player.HasMedia + !String.IsEmpty(Skin.String(HomeFanart.path))</visible>
+ 		</control>

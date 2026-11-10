@@ -1,0 +1,21 @@
+# Kodi source (cloned at the base commit; not part of this repository)
+/src/kodi/
+
+# Build outputs
+/build/
+/dist/
+*.o
+*.a
+*.spv
+*.sb
+*.oelf
+eboot.bin
+pkg.gp4
+*.pkg
+
+# Port state
+/port/.applied
+
+# Python
+__pycache__/
+*.pyc
