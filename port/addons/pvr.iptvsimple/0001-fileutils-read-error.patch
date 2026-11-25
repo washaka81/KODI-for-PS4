@@ -1,0 +1,54 @@
+diff --git a/src/iptvsimple/utilities/FileUtils.cpp b/src/iptvsimple/utilities/FileUtils.cpp
+index 05e2a34..a11e1aa 100644
+--- a/src/iptvsimple/utilities/FileUtils.cpp
++++ b/src/iptvsimple/utilities/FileUtils.cpp
+@@ -15,6 +15,12 @@
+ using namespace iptvsimple;
+ using namespace iptvsimple::utilities;
+ 
++namespace
++{
++// A malformed or hostile M3U/EPG must not be able to exhaust the console heap.
++constexpr size_t MAX_FILE_CONTENTS = 64 * 1024 * 1024;
++} // namespace
++
+ std::string FileUtils::PathCombine(const std::string& path, const std::string& fileName)
+ {
+   std::string result = path;
+@@ -52,8 +58,18 @@ int FileUtils::GetFileContents(const std::string& url, std::string& content)
+   if (file.OpenFile(url))
+   {
+     char buffer[1024];
+-    while (int bytesRead = file.Read(buffer, 1024))
++    int bytesRead;
++    while ((bytesRead = file.Read(buffer, sizeof(buffer))) > 0)
++    {
++      if (content.size() + static_cast<size_t>(bytesRead) > MAX_FILE_CONTENTS)
++      {
++        Logger::Log(LEVEL_ERROR, "%s - file '%s' exceeds %zu bytes", __FUNCTION__,
++                    url.c_str(), MAX_FILE_CONTENTS);
++        content.clear();
++        break;
++      }
+       content.append(buffer, bytesRead);
++    }
+   }
+ 
+   return content.length();
+@@ -301,7 +317,16 @@ std::string FileUtils::ReadFileContents(kodi::vfs::CFile& file)
+ 
+   // Read until EOF or explicit error
+   while ((bytesRead = file.Read(buffer, sizeof(buffer) - 1)) > 0)
++  {
++    if (fileContents.size() + static_cast<size_t>(bytesRead) > MAX_FILE_CONTENTS)
++    {
++      Logger::Log(LEVEL_ERROR, "%s - file exceeds %zu bytes", __FUNCTION__,
++                  MAX_FILE_CONTENTS);
++      fileContents.clear();
++      break;
++    }
+     fileContents.append(buffer, bytesRead);
++  }
+ 
+   return fileContents;
+ }

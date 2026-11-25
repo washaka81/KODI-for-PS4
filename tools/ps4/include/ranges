@@ -1,0 +1,516 @@
+#pragma once
+// std::ranges polyfill for the OpenOrbis PS4 sysroot.
+//
+// The PS4 SDK ships libc++ 11 (LLVM 11), which has no <ranges> header.
+// Kodi 23 needs the C++20 range algorithms, so this file provides the
+// subset the port uses and is installed into the SDK include path by
+// scripts/setup-m1-deps.sh.
+//
+// The toolchain force-includes this header into every C++ translation unit,
+// including the ones built as C++17 by the external projects, so the
+// C++20-only constructs are guarded.
+
+#include <algorithm>
+#include <iterator>
+#include <functional>
+#include <utility>
+#include <compare>
+
+namespace std { inline namespace __1 {
+
+// Concepts polyfill.  libc++ 11 only ships same_as, so derived_from and
+// invocable have to be provided here.
+#if __cplusplus >= 202002L
+template<class T, class U>
+concept derived_from = std::is_base_of_v<U, T> && std::is_convertible_v<const volatile T*, const volatile U*>;
+
+template<class Fn, class... Args>
+concept invocable = requires(Fn&& fn, Args&&... args) { invoke(std::forward<Fn>(fn), std::forward<Args>(args)...); };
+#endif
+
+namespace ranges {
+struct less {
+  template<class A, class B>
+  constexpr bool operator()(const A& a, const B& b) const { return a < b; }
+};
+struct greater {
+  template<class A, class B>
+  constexpr bool operator()(const A& a, const B& b) const { return a > b; }
+};
+struct equal_to {
+  template<class A, class B>
+  constexpr bool operator()(const A& a, const B& b) const { return a == b; }
+};
+// invoke helper (handles member pointers with smart pointers)
+template<class F, class T>
+constexpr decltype(auto) invoke(F&& f, T&& t) {
+  if constexpr (std::is_member_pointer_v<std::decay_t<F>>) {
+    if constexpr (std::is_member_function_pointer_v<std::decay_t<F>>) {
+      if constexpr (std::is_pointer_v<std::decay_t<T>>) {
+        return (t->*f)();
+#if __cplusplus >= 202002L
+      } else if constexpr (requires { (t.*f)(); }) {
+        return (t.*f)();
+      } else if constexpr (requires { (t->*f)(); }) {
+        return (t->*f)();
+      } else if constexpr (requires { (t.get()->*f)(); }) {
+        return (t.get()->*f)();
+      } else if constexpr (requires { ((*t).*f)(); }) {
+        return ((*t).*f)();
+#endif
+      } else {
+        return t;
+      }
+    } else {
+      if constexpr (std::is_pointer_v<std::decay_t<T>>) {
+        return t->*f;
+#if __cplusplus >= 202002L
+      } else if constexpr (requires { t.*f; }) {
+        return t.*f;
+      } else if constexpr (requires { t->*f; }) {
+        return t->*f;
+      } else if constexpr (requires { t.get()->*f; }) {
+        return t.get()->*f;
+      } else if constexpr (requires { (*t).*f; }) {
+        return (*t).*f;
+#endif
+      } else {
+        return t;
+      }
+    }
+  } else {
+    return std::forward<F>(f)(std::forward<T>(t));
+  }
+}
+
+
+struct identity {
+  template<class T>
+  constexpr T&& operator()(T&& t) const noexcept { return std::forward<T>(t); }
+};
+
+template<class T>
+using invoke_result_t = decltype(invoke(std::declval<T>(), std::declval<int>()));
+
+// find
+template<class R, class T, class Proj = identity>
+constexpr auto find(R&& r, const T& value, Proj proj = {}) {
+  return std::find_if(std::begin(r), std::end(r),
+    [&](auto&& x) { return invoke(proj, x) == value; });
+}
+
+// find_if
+template<class R, class Pred, class Proj = identity>
+constexpr auto find_if(R&& r, Pred pred, Proj proj = {}) {
+  return std::find_if(std::begin(r), std::end(r),
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// find_first_of
+template<class R1, class R2, class Comp = equal_to, class Proj1 = identity, class Proj2 = identity>
+constexpr auto find_first_of(R1&& r1, R2&& r2, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::find_first_of(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// any_of
+template<class R, class Pred, class Proj = identity>
+constexpr bool any_of(R&& r, Pred pred, Proj proj = {}) {
+  return std::any_of(std::begin(r), std::end(r),
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// all_of
+template<class R, class Pred, class Proj = identity>
+constexpr bool all_of(R&& r, Pred pred, Proj proj = {}) {
+  return std::all_of(std::begin(r), std::end(r),
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// none_of
+template<class R, class Pred, class Proj = identity>
+constexpr bool none_of(R&& r, Pred pred, Proj proj = {}) {
+  return std::none_of(std::begin(r), std::end(r),
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// for_each
+template<class R, class Func, class Proj = identity>
+constexpr auto for_each(R&& r, Func func, Proj proj = {}) {
+  for (auto& x : r) func(invoke(proj, x));
+  return func;
+}
+
+// transform (input range + output iterator)
+template<class R, class O, class Op, class Proj = identity>
+constexpr auto transform(R&& r, O out, Op op, Proj proj = {}) {
+  return std::transform(std::begin(r), std::end(r), out,
+    [&](auto&& x) { return invoke(op, invoke(proj, x)); });
+}
+
+// copy
+template<class R, class O>
+constexpr auto copy(R&& r, O out) {
+  return std::copy(std::begin(r), std::end(r), out);
+}
+
+// copy_if
+template<class R, class O, class Pred, class Proj = identity>
+constexpr auto copy_if(R&& r, O out, Pred pred, Proj proj = {}) {
+  return std::copy_if(std::begin(r), std::end(r), out,
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// sort
+template<class R, class Comp = less, class Proj = identity>
+constexpr void sort(R&& r, Comp comp = {}, Proj proj = {}) {
+  std::sort(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// stable_sort
+template<class R, class Comp = less, class Proj = identity>
+constexpr void stable_sort(R&& r, Comp comp = {}, Proj proj = {}) {
+  std::stable_sort(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// count
+template<class R, class T, class Proj = identity>
+constexpr auto count(R&& r, const T& value, Proj proj = {}) {
+  return std::count_if(std::begin(r), std::end(r),
+    [&](auto&& x) { return invoke(proj, x) == value; });
+}
+
+// count_if
+template<class R, class Pred, class Proj = identity>
+constexpr auto count_if(R&& r, Pred pred, Proj proj = {}) {
+  return std::count_if(std::begin(r), std::end(r),
+    [&](auto&& x) { return pred(invoke(proj, x)); });
+}
+
+// lower_bound
+template<class R, class T, class Comp = less, class Proj = identity>
+constexpr auto lower_bound(R&& r, const T& value, Comp comp = {}, Proj proj = {}) {
+  auto it = std::begin(r);
+  for (; it != std::end(r); ++it) {
+    if (!comp(invoke(proj, *it), value)) break;
+  }
+  return it;
+}
+
+// upper_bound
+template<class R, class T, class Comp = less, class Proj = identity>
+constexpr auto upper_bound(R&& r, const T& value, Comp comp = {}, Proj proj = {}) {
+  auto it = std::begin(r);
+  for (; it != std::end(r); ++it) {
+    if (comp(value, invoke(proj, *it))) break;
+  }
+  return it;
+}
+
+// binary_search
+template<class R, class T, class Comp = less, class Proj = identity>
+constexpr bool binary_search(R&& r, const T& value, Comp comp = {}, Proj proj = {}) {
+  auto it = lower_bound(r, value, comp, proj);
+  return it != std::end(r) && !comp(invoke(proj, *it), value) && !comp(value, invoke(proj, *it));
+}
+
+// min_element
+template<class R, class Comp = less, class Proj = identity>
+constexpr auto min_element(R&& r, Comp comp = {}, Proj proj = {}) {
+  return std::min_element(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// max_element
+template<class R, class Comp = less, class Proj = identity>
+constexpr auto max_element(R&& r, Comp comp = {}, Proj proj = {}) {
+  return std::max_element(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// min (range)
+template<class R, class Comp = less, class Proj = identity>
+constexpr auto min(R&& r, Comp comp = {}, Proj proj = {}) {
+  auto it = min_element(r, comp, proj);
+  return *it;
+}
+
+// max (range)
+template<class R, class Comp = less, class Proj = identity>
+constexpr auto max(R&& r, Comp comp = {}, Proj proj = {}) {
+  auto it = max_element(r, comp, proj);
+  return *it;
+}
+
+// adjacent_find
+template<class R, class Comp = equal_to, class Proj = identity>
+constexpr auto adjacent_find(R&& r, Comp comp = {}, Proj proj = {}) {
+  return std::adjacent_find(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// equal
+template<class R1, class R2, class Comp = equal_to, class Proj1 = identity, class Proj2 = identity>
+constexpr bool equal(R1&& r1, R2&& r2, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::equal(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// is_sorted
+template<class R, class Comp = less, class Proj = identity>
+constexpr bool is_sorted(R&& r, Comp comp = {}, Proj proj = {}) {
+  return std::is_sorted(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// unique
+template<class R, class Comp = equal_to, class Proj = identity>
+constexpr auto unique(R&& r, Comp comp = {}, Proj proj = {}) {
+  return std::unique(std::begin(r), std::end(r),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj, a), invoke(proj, b)); });
+}
+
+// reverse
+template<class R>
+constexpr void reverse(R&& r) { std::reverse(std::begin(r), std::end(r)); }
+
+// rotate
+template<class R, class I>
+constexpr auto rotate(R&& r, I middle) {
+  return std::rotate(std::begin(r), middle, std::end(r));
+}
+
+// fill
+template<class R, class T>
+constexpr void fill(R&& r, const T& value) { std::fill(std::begin(r), std::end(r), value); }
+
+// replace
+template<class R, class T>
+constexpr void replace(R&& r, const T& oldv, const T& newv) { std::replace(std::begin(r), std::end(r), oldv, newv); }
+
+// set_difference
+template<class R1, class R2, class O, class Comp = less, class Proj1 = identity, class Proj2 = identity>
+constexpr auto set_difference(R1&& r1, R2&& r2, O out, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::set_difference(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2), out,
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// search
+template<class R1, class R2, class Comp = less, class Proj1 = identity, class Proj2 = identity>
+constexpr auto search(R1&& r1, R2&& r2, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::search(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// includes
+template<class R1, class R2, class Comp = less, class Proj1 = identity, class Proj2 = identity>
+constexpr bool includes(R1&& r1, R2&& r2, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::includes(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// lexicographical_compare
+template<class R1, class R2, class Comp = less, class Proj1 = identity, class Proj2 = identity>
+constexpr bool lexicographical_compare(R1&& r1, R2&& r2, Comp comp = {}, Proj1 proj1 = {}, Proj2 proj2 = {}) {
+  return std::lexicographical_compare(std::begin(r1), std::end(r1), std::begin(r2), std::end(r2),
+    [&](auto&& a, auto&& b) { return comp(invoke(proj1, a), invoke(proj2, b)); });
+}
+
+// move
+template<class R, class O>
+constexpr auto move(R&& r, O out) {
+  return std::move(std::begin(r), std::end(r), out);
+}
+
+// adjacent (distance/advance/begin/empty) - use std
+
+} // namespace ranges
+
+// views (minimal): std::views::filter and std::views::keys
+namespace views {
+namespace detail {
+
+// Forward iterator that skips the elements rejected by the predicate.
+template<class BaseIter, class Pred>
+class filter_iterator
+{
+public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = typename std::iterator_traits<BaseIter>::value_type;
+  using difference_type = typename std::iterator_traits<BaseIter>::difference_type;
+  using pointer = typename std::iterator_traits<BaseIter>::pointer;
+  using reference = typename std::iterator_traits<BaseIter>::reference;
+
+  filter_iterator() = default;
+  filter_iterator(BaseIter it, BaseIter end, Pred pred)
+    : m_it(std::move(it)), m_end(std::move(end)), m_pred(std::move(pred))
+  {
+    SkipRejected();
+  }
+
+  reference operator*() const { return *m_it; }
+  pointer operator->() const { return &(*m_it); }
+
+  filter_iterator& operator++()
+  {
+    ++m_it;
+    SkipRejected();
+    return *this;
+  }
+
+  filter_iterator operator++(int)
+  {
+    filter_iterator tmp(*this);
+    ++(*this);
+    return tmp;
+  }
+
+  bool operator==(const filter_iterator& other) const { return m_it == other.m_it; }
+  bool operator!=(const filter_iterator& other) const { return m_it != other.m_it; }
+
+private:
+  void SkipRejected()
+  {
+    while (m_it != m_end && !m_pred(*m_it))
+      ++m_it;
+  }
+
+  BaseIter m_it{};
+  BaseIter m_end{};
+  Pred m_pred{};
+};
+
+template<class R, class Pred>
+class filter_view
+{
+public:
+  using BaseIter = decltype(std::begin(std::declval<const R&>()));
+
+  filter_view() = default;
+  constexpr filter_view(R base, Pred pred) : m_base(std::move(base)), m_pred(std::move(pred)) {}
+
+  constexpr auto begin() const
+  {
+    return filter_iterator<BaseIter, Pred>(std::begin(m_base), std::end(m_base), m_pred);
+  }
+  constexpr auto end() const
+  {
+    return filter_iterator<BaseIter, Pred>(std::end(m_base), std::end(m_base), m_pred);
+  }
+
+private:
+  R m_base{};
+  Pred m_pred{};
+};
+
+template<class R>
+class keys_view
+{
+public:
+  using BaseIter = decltype(std::begin(std::declval<const R&>()));
+
+  class iterator
+  {
+  public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = typename std::iterator_traits<BaseIter>::value_type;
+    using difference_type = typename std::iterator_traits<BaseIter>::difference_type;
+    using pointer = typename std::iterator_traits<BaseIter>::pointer;
+    using reference = decltype(std::declval<BaseIter>()->first);
+
+    iterator() = default;
+    explicit iterator(BaseIter it) : m_it(std::move(it)) {}
+
+    reference operator*() const { return m_it->first; }
+    pointer operator->() const { return &m_it->first; }
+
+    iterator& operator++()
+    {
+      ++m_it;
+      return *this;
+    }
+    iterator operator++(int)
+    {
+      iterator tmp(*this);
+      ++(*this);
+      return tmp;
+    }
+
+    bool operator==(const iterator& other) const { return m_it == other.m_it; }
+    bool operator!=(const iterator& other) const { return m_it != other.m_it; }
+
+  private:
+    BaseIter m_it{};
+  };
+
+  keys_view() = default;
+  constexpr explicit keys_view(R base) : m_base(std::move(base)) {}
+
+  constexpr auto begin() const { return iterator(std::begin(m_base)); }
+  constexpr auto end() const { return iterator(std::end(m_base)); }
+
+private:
+  R m_base{};
+};
+
+template<class Pred>
+struct filter_closure
+{
+  Pred pred;
+
+  template<class R>
+  constexpr auto operator()(R&& r) const
+  {
+    return filter_view<std::decay_t<R>, Pred>(std::forward<R>(r), pred);
+  }
+};
+
+struct keys_closure
+{
+  template<class R2>
+  constexpr auto operator()(R2&& r) const
+  {
+    return keys_view<std::decay_t<R2>>(std::forward<R2>(r));
+  }
+};
+
+template<class R, class Pred>
+constexpr auto operator|(R&& r, const filter_closure<Pred>& closure)
+{
+  return closure(std::forward<R>(r));
+}
+
+} // namespace detail
+
+struct filter_fn
+{
+  template<class Pred>
+  constexpr auto operator()(Pred pred) const
+  {
+    return detail::filter_closure<Pred>{std::move(pred)};
+  }
+};
+
+struct keys_fn
+{
+  template<class R>
+  constexpr auto operator()(R&& r) const
+  {
+    return detail::keys_closure{}(std::forward<R>(r));
+  }
+};
+
+inline constexpr filter_fn filter{};
+inline constexpr keys_fn keys{};
+
+template<class R>
+constexpr auto operator|(R&& r, const keys_fn& adaptor)
+{
+  return adaptor(std::forward<R>(r));
+}
+
+} // namespace views
+
+} } // namespace std::__1

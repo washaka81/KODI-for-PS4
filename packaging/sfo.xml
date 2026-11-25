@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Placeholder packaging metadata for the future LibOrbisPkg workflow. -->
+<!-- Typical PS4 app requires a real PARAM.SFO with CATEGORY=gdc, TITLE_ID=CUSAxxxxx, VERSION=01.00, and SYSTEM_VER. -->
+<sfo>
+  <field name="CATEGORY" value="gdc" />
+  <field name="TITLE_ID" value="CUSA54261" />
+  <field name="TITLE" value="Kodi PS4" />
+  <field name="VERSION" value="01.00" />
+  <field name="SYSTEM_VER" value="09.000000" />
+</sfo>

@@ -1,0 +1,25 @@
+--- a/libavformat/tls_mbedtls.c
++++ b/libavformat/tls_mbedtls.c
+@@ -32,6 +32,8 @@
+ #include <psa/crypto.h>
+ #endif
+ 
++#include <stdlib.h>
++
+ #include "config_components.h"
+ 
+ #include "avformat.h"
+@@ -550,8 +552,11 @@
+     }
+ 
+     // load trusted CA
+-    if (shr->ca_file) {
+-        if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, shr->ca_file)) != 0) {
++    const char *ca_file = shr->ca_file;
++    if (!ca_file)
++        ca_file = getenv("SSL_CERT_FILE");
++    if (ca_file) {
++        if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, ca_file)) != 0) {
+             av_log(h, AV_LOG_ERROR, "mbedtls_x509_crt_parse_file for CA cert returned %d\n", ret);
+             goto fail;
+         }

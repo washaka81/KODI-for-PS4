@@ -1,0 +1,18 @@
+base d686683a55d50e576dd282f53fb2bf9914931b38
+commits 12
+patches 13
+overlay 0
+sha256
+9ab07fba57e33f217bf15ec0ee65f4d79c26902329d06301e9441ad2d9d979e2  patches/0001-ps4-build-and-toolchain-support.patch
+b46f49dc71984b602ee24d0248ef917da198d8173084993e0647ab85804b4f8f  patches/0002-ps4-ABI-compatibility-for-the-Orbis-toolchain.patch
+5625c8bc10cade3231332669bfeaa8ee2edeef2cd33db8aeb96c4931e94a5ced  patches/0003-ps4-GLES-EGL-windowing-and-shader-translator.patch
+1221c2f353d9b78d4cc1bfc128b0c3821e00082d16fd4090581f446ac2bd6ac0  patches/0004-ps4-network-and-FFmpeg-translators.patch
+aa687e22f02b4654dc9baf186d0ce0c61889ea02c33c445cf75a0ac66f283ad1  patches/0005-ps4-audio-and-input-platform.patch
+9ee5de95a7a45a55e8284562ad0f20a7a5ded48bc27aba621b8ff5b9cb75487b  patches/0006-ps4-platform-services-and-launcher.patch
+87e18b08d6c812fdb9adc56d7adfcdc8713761fd558f39f1b52b30e53a248571  patches/0007-ps4-remaining-translator-and-ABI-glue.patch
+d3a2ece3e9e6d1b3425941de8bd1b7d39b28f2ff81219bebd6cdac4b31c010e8  patches/0008-ps4-keep-the-glshim-trace-hook-as-a-no-op.patch
+429ffa0ac4db930c91662dbe76b89458458a71d4a09faa498052efbb663ec079  patches/0009-ps4-use-the-SQLite-dotfile-VFS.patch
+3986392b4c547c2035f42e6ac15ce21e8fd1436751269dc3c4673152fc74d0fb  patches/0010-ps4-bound-add-on-and-SQLite-memory-use.patch
+0ee63e917d3eee127e2e3a45a1674d351cfd49ff2a0f267522424b04668e7ad6  patches/0011-ps4-keep-SQLite-temporary-b-trees-in-memory.patch
+593e83de68dfaea8eb0f17ba5f26e87956e0207ad851c7f74da6231dae02d9c0  patches/0012-ps4-recover-from-stale-SQLite-dotfile-locks.patch
+9b91343c8dfaeef60b1c505b5457f067dcb6acec64f9c37ab2d1d1ec580a74ed  patches/0013-work-in-progress.patch

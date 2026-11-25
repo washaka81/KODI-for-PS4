@@ -1,0 +1,47 @@
+--- a/Modules/socketmodule.c
++++ b/Modules/socketmodule.c
+@@ -549,7 +549,7 @@
+ } socket_state;
+ 
+ #if defined(HAVE_ACCEPT) || defined(HAVE_ACCEPT4)
+-#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC)
++#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC) && !defined(__ORBIS__)
+ /* accept4() is available on Linux 2.6.28+ and glibc 2.10 */
+ static int accept4_works = -1;
+ #endif
+@@ -3041,7 +3041,7 @@
+     }
+ #endif
+ 
+-#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC)
++#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC) && !defined(__ORBIS__)
+     if (_Py_atomic_load_int_relaxed(&accept4_works) != 0) {
+         ctx->result = accept4(get_sock_fd(s), addr, paddrlen,
+                               SOCK_CLOEXEC);
+@@ -3106,7 +3106,7 @@
+ #endif
+ #else
+ 
+-#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC)
++#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC) && !defined(__ORBIS__)
+     if (!_Py_atomic_load_int_relaxed(&accept4_works))
+ #endif
+     {
+@@ -5778,7 +5778,7 @@
+ #else
+         /* UNIX */
+         Py_BEGIN_ALLOW_THREADS
+-#ifdef SOCK_CLOEXEC
++#if defined(SOCK_CLOEXEC) && !defined(__ORBIS__)
+         if (_Py_atomic_load_int_relaxed(&sock_cloexec_works) != 0) {
+             fd = socket(family, type | SOCK_CLOEXEC, proto);
+             if (_Py_atomic_load_int_relaxed(&sock_cloexec_works) == -1) {
+@@ -6550,7 +6550,7 @@
+ 
+     /* Create a pair of socket fds */
+     Py_BEGIN_ALLOW_THREADS
+-#ifdef SOCK_CLOEXEC
++#if defined(SOCK_CLOEXEC) && !defined(__ORBIS__)
+     if (_Py_atomic_load_int_relaxed(&sock_cloexec_works) != 0) {
+         ret = socketpair(family, type | SOCK_CLOEXEC, proto, sv);
+         if (_Py_atomic_load_int_relaxed(&sock_cloexec_works) == -1) {

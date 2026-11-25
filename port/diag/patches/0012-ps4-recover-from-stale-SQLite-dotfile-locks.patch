@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 20:43:28 -0300
+Subject: [PATCH 12/12] ps4: recover from stale SQLite dotfile locks
+
+A hard close leaves the unix-dotfile <db>.lock directories behind; the next start blocks forever in the busy handler and the splash never ends. Remove stale locks before CDatabaseManager opens the first database, and stop retrying after 10 s so a remaining lock fails visibly instead of hanging. Only locks with a matching .db file are removed.
+---
+ xbmc/ServiceManager.cpp                |  10 ++
+ xbmc/dbwrappers/sqlitedataset.cpp      |  11 ++-
+ xbmc/platform/ps4/CMakeLists.txt       |   2 +
+ xbmc/platform/ps4/PS4DatabaseLocks.cpp | 124 +++++++++++++++++++++++++
+ xbmc/platform/ps4/PS4DatabaseLocks.h   |  31 +++++++
+ 5 files changed, 177 insertions(+), 1 deletion(-)
+ create mode 100644 xbmc/platform/ps4/PS4DatabaseLocks.cpp
+ create mode 100644 xbmc/platform/ps4/PS4DatabaseLocks.h
+
+diff --git a/xbmc/ServiceManager.cpp b/xbmc/ServiceManager.cpp
+index 929a8f2e3b..d4871a77ca 100644
+--- a/xbmc/ServiceManager.cpp
++++ b/xbmc/ServiceManager.cpp
+@@ -43,6 +43,9 @@
+ #if !defined(TARGET_WINDOWS) && defined(HAS_OPTICAL_DRIVE)
+ #include "storage/DetectDVDType.h"
+ #endif
++#if defined(__ORBIS__)
++#include "platform/ps4/PS4DatabaseLocks.h"
++#endif
+ #include "pictures/SlideShowDelegator.h"
+ #include "storage/MediaManager.h"
+ #include "utils/FileExtensionProvider.h"
+@@ -128,6 +131,13 @@ bool CServiceManager::InitStageOne()
+ 
+ bool CServiceManager::InitStageTwo(const std::string& profilesUserDataFolder)
+ {
++#if defined(__ORBIS__)
++  // A hard close leaves SQLite's unix-dotfile lock directories behind.  On
++  // PS4 there is only one Kodi instance, so anything present now is stale.
++  // Clean it before CDatabaseManager opens the first database.
++  KODI::PLATFORM::PS4::RemoveStaleDatabaseLocks(profilesUserDataFolder);
++#endif
++
+ #ifdef HAS_PYTHON
+   // checked here rather than at construction so the failure reaches kodi.log
+   if (!m_XBPython->BindingModulesLoaded())
+diff --git a/xbmc/dbwrappers/sqlitedataset.cpp b/xbmc/dbwrappers/sqlitedataset.cpp
+index 8340d73ce0..b2670910cd 100644
+--- a/xbmc/dbwrappers/sqlitedataset.cpp
++++ b/xbmc/dbwrappers/sqlitedataset.cpp
+@@ -206,8 +206,17 @@ int callback(void* res_ptr, int ncol, char** result, char** cols)
+   return 0;
+ }
+ 
+-int busy_callback(void*, int /*busyCount*/)
++int busy_callback(void*, int busyCount)
+ {
++  // A stale unix-dotfile lock must not keep Kodi on the splash screen forever.
++  static constexpr int MAX_RETRIES = 100; // 100 * 100 ms
++  if (busyCount >= MAX_RETRIES)
++  {
++    CLog::Log(LOGERROR, "SqliteDatabase: database still locked after {} retries, giving up",
++              busyCount);
++    return 0;
++  }
++
+   KODI::TIME::Sleep(100ms);
+   return 1;
+ }
+diff --git a/xbmc/platform/ps4/CMakeLists.txt b/xbmc/platform/ps4/CMakeLists.txt
+index a5e3e2887a..ae6ef97c8a 100644
+--- a/xbmc/platform/ps4/CMakeLists.txt
++++ b/xbmc/platform/ps4/CMakeLists.txt
+@@ -9,6 +9,7 @@ set(SOURCES ../linux/AppParamParserLinux.cpp
+             PlatformFreebsd.cpp
+             PS4HardwareProfile.cpp
+             PS4Launcher.cpp
++            PS4DatabaseLocks.cpp
+             PS4ShaderBin.cpp
+             PS4AudioSink.cpp
+             PS4Input.cpp
+@@ -24,6 +25,7 @@ set(HEADERS ../linux/AppParamParserLinux.cpp
+             PlatformFreebsd.h
+             PS4HardwareProfile.h
+             PS4Launcher.h
++            PS4DatabaseLocks.h
+             PS4ShaderBin.h
+             PS4AudioSink.h
+             PS4Input.h
+diff --git a/xbmc/platform/ps4/PS4DatabaseLocks.cpp b/xbmc/platform/ps4/PS4DatabaseLocks.cpp
+new file mode 100644
+index 0000000000..e6248b5341
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4DatabaseLocks.cpp
+@@ -0,0 +1,124 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "PS4DatabaseLocks.h"
++
++#include "filesystem/SpecialProtocol.h"
++#include "utils/log.h"
++
++#include <cerrno>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include <dirent.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace
++{
++
++constexpr const char* LOCK_SUFFIX = ".lock";
++
++bool EndsWithLock(const std::string& name)
++{
++  const std::string suffix{LOCK_SUFFIX};
++  return name.size() > suffix.size() &&
++         name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++/*! \brief Remove the .lock entries of one Database directory.
++ *
++ * A lock is only removed when the matching database file exists, so an
++ * unrelated .lock file in userdata is never touched.
++ */
++void CleanDatabaseFolder(const std::string& folder)
++{
++  DIR* dir = opendir(folder.c_str());
++  if (!dir)
++    return;
++
++  std::vector<std::string> locks;
++  while (dirent* entry = readdir(dir))
++  {
++    const std::string name{entry->d_name};
++    if (name == "." || name == ".." || !EndsWithLock(name))
++      continue;
++
++    const std::string dbName = name.substr(0, name.size() - std::strlen(LOCK_SUFFIX));
++    const std::string dbPath = folder + "/" + dbName;
++    // PS4's lstat() returns EPERM and stat() may lie about the size, but
++    // access() is reliable for an existence check.
++    if (access(dbPath.c_str(), F_OK) != 0)
++      continue;
++
++    locks.push_back(folder + "/" + name);
++  }
++  closedir(dir);
++
++  for (const std::string& path : locks)
++  {
++    // The dotfile VFS creates an empty directory; fall back to unlink for a
++    // regular file.  Avoid lstat(), which returns EPERM on PS4.
++    int rc = rmdir(path.c_str());
++    if (rc != 0)
++      rc = unlink(path.c_str());
++
++    if (rc == 0)
++    {
++      CLog::Log(LOGINFO, "PS4: removed stale database lock {}", path);
++    }
++    else
++    {
++      CLog::Log(LOGERROR, "PS4: could not remove database lock {}: {} ({})", path,
++                std::strerror(errno), errno);
++    }
++  }
++}
++
++void CleanProfileDatabases(const std::string& userDataFolder)
++{
++  CleanDatabaseFolder(userDataFolder + "/Database");
++
++  const std::string profilesFolder = userDataFolder + "/profiles";
++  DIR* profiles = opendir(profilesFolder.c_str());
++  if (!profiles)
++    return;
++
++  std::vector<std::string> profileNames;
++  while (dirent* entry = readdir(profiles))
++  {
++    const std::string name{entry->d_name};
++    if (name == "." || name == "..")
++      continue;
++
++    const std::string path = profilesFolder + "/" + name;
++    struct stat st = {};
++    if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
++      profileNames.push_back(name);
++  }
++  closedir(profiles);
++
++  for (const std::string& name : profileNames)
++    CleanDatabaseFolder(profilesFolder + "/" + name + "/Database");
++}
++
++} // namespace
++
++namespace KODI::PLATFORM::PS4
++{
++
++void RemoveStaleDatabaseLocks(const std::string& userDataFolder)
++{
++  if (userDataFolder.empty())
++    return;
++
++  CleanProfileDatabases(CSpecialProtocol::TranslatePath(userDataFolder));
++}
++
++} // namespace KODI::PLATFORM::PS4
+diff --git a/xbmc/platform/ps4/PS4DatabaseLocks.h b/xbmc/platform/ps4/PS4DatabaseLocks.h
+new file mode 100644
+index 0000000000..43ef145968
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4DatabaseLocks.h
+@@ -0,0 +1,31 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <string>
++
++namespace KODI::PLATFORM::PS4
++{
++
++/*! \brief Remove stale SQLite dotfile locks from the database folders.
++ *
++ * The PS4 has no POSIX advisory locks, so Kodi uses SQLite's unix-dotfile
++ * VFS.  That VFS represents a lock as a <database>.db.lock directory.  If
++ * Kodi is killed without a clean shutdown, the directories survive and the
++ * next start blocks forever in the SQLite busy handler.
++ *
++ * PS4 runs a single Kodi instance, so any lock found before the first
++ * database is opened belongs to a dead process and can be removed safely.
++ * Only entries that have a matching .db file next to them are touched.
++ *
++ * \param userDataFolder current profile userdata folder (contains Database/)
++ */
++void RemoveStaleDatabaseLocks(const std::string& userDataFolder);
++
++} // namespace KODI::PLATFORM::PS4

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon
+  id="script.ps4.launcher"
+  version="1.0.0"
+  name="PS4 App Launcher"
+  provider-name="Kodi PS4 port">
+  <requires>
+    <import addon="xbmc.python" version="3.1.0"/>
+  </requires>
+  <extension point="xbmc.python.script" library="default.py"/>
+  <extension point="xbmc.addon.metadata">
+    <platform>all</platform>
+    <summary lang="en_GB">Launch installed PS4 applications</summary>
+    <summary lang="es_ES">Lanza aplicaciones instaladas de PS4</summary>
+    <description lang="en_GB">Shows the installed PS4 applications and launches the selected one with sceLncUtilLaunchApp.</description>
+    <description lang="es_ES">Muestra las aplicaciones instaladas de PS4 y lanza la seleccionada con sceLncUtilLaunchApp.</description>
+    <license>GPL-2.0-or-later</license>
+  </extension>
+</addon>

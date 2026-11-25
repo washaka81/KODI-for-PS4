@@ -1,0 +1,81 @@
+From: Kodi PS4 port
+Subject: [PATCH] libavformat/tcp: apply the console network policy/priority
+
+The PS4 exposes SoPolicy (0x1201) and SoPriority (0x1203) on
+SolSocket (0xffff). libSceHttp uses them for its requests; FFmpeg opens
+the HLS segments itself, so it must apply the same values or the video
+path bypasses the policy. The values come from the same optional files
+as the curl side, so there is no console-specific default.
+---
+diff --git a/libavformat/tcp.c b/libavformat/tcp.c
+--- a/libavformat/tcp.c
++++ b/libavformat/tcp.c
+@@ -29,6 +29,8 @@
+ #include "network.h"
+ #include "os_support.h"
+ #include "url.h"
++#include <stdio.h>
++#include <stdlib.h>
+ #if HAVE_POLL_H
+ #include <poll.h>
+ #endif
+@@ -88,6 +90,48 @@
+     return 0;
+ }
+ 
++#if defined(__ORBIS__)
++/* The console exposes SoPolicy (0x1201) and SoPriority (0x1203) on
++ * SolSocket (0xffff).  libSceHttp uses them for its requests; FFmpeg opens
++ * the HLS segments itself, so it must apply the same values or the video
++ * path bypasses the policy.  The values come from the same optional files
++ * as the curl side, so there is no console-specific default. */
++static int ps4_read_net_int(const char *path, int def)
++{
++    FILE *f = fopen(path, "r");
++    int value = def;
++    if (!f)
++        return def;
++    if (fscanf(f, "%d", &value) != 1)
++        value = def;
++    fclose(f);
++    return value;
++}
++
++static void ps4_apply_net_policy(void *ctx, int fd)
++{
++    static int logged;
++    int policy = ps4_read_net_int("/data/kodi-ps4/net-policy", -1);
++    int priority = ps4_read_net_int("/data/kodi-ps4/net-priority", -1);
++    int rc;
++
++    if (priority >= 0) {
++        rc = setsockopt(fd, 0xffff, 0x1203, &priority, sizeof(priority));
++        if (!logged)
++            av_log(ctx, rc ? AV_LOG_WARNING : AV_LOG_INFO,
++                   "PS4 net policy: priority=%d rc=%d\n", priority, rc);
++    }
++    if (policy >= 0) {
++        rc = setsockopt(fd, 0xffff, 0x1201, &policy, sizeof(policy));
++        if (!logged)
++            av_log(ctx, rc ? AV_LOG_WARNING : AV_LOG_INFO,
++                   "PS4 net policy: policy=%d rc=%d\n", policy, rc);
++    }
++    if ((policy >= 0 || priority >= 0) && !logged)
++        logged = 1;
++}
++#endif
++
+ static int customize_fd(void *ctx, int fd, int family)
+ {
+     TCPContext *s = ctx;
+@@ -169,6 +213,10 @@
+     }
+ #endif /* !HAVE_WINSOCK2_H */
+ 
++#if defined(__ORBIS__)
++    ps4_apply_net_policy(ctx, fd);
++#endif
++
+     return 0;
+ }
+ 

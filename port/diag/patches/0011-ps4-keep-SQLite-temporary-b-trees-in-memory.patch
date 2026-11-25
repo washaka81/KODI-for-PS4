@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 19:42:03 -0300
+Subject: [PATCH 11/12] ps4: keep SQLite temporary b-trees in memory
+
+The reduced 128-page cache spills the repository catalog ORDER BY to a temporary file; Orbis has no usable temporary path, and SQLite fails with SQLITE_IOERR_GETTEMPPATH on an empty filename. Use PRAGMA temp_store=MEMORY on Orbis so the sorter stays in the flexible heap.
+---
+ xbmc/dbwrappers/sqlitedataset.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/dbwrappers/sqlitedataset.cpp b/xbmc/dbwrappers/sqlitedataset.cpp
+index 53b6232a70..8340d73ce0 100644
+--- a/xbmc/dbwrappers/sqlitedataset.cpp
++++ b/xbmc/dbwrappers/sqlitedataset.cpp
+@@ -435,8 +435,11 @@ int SqliteDatabase::postconnect()
+     throw DbErrors("Cannot execute postconnect actions: no active connection...");
+ 
+ #if defined(__ORBIS__)
++  // The catalog query sorts more rows than the reduced page cache can hold.
++  // Keep the temporary b-tree in memory: Orbis has no usable temp path.
+   static const char* sqlcmd{
+-      "PRAGMA cache_size=128; PRAGMA synchronous='NORMAL'; PRAGMA count_changes='OFF';"};
++      "PRAGMA cache_size=128; PRAGMA temp_store=MEMORY; PRAGMA synchronous='NORMAL'; "
++      "PRAGMA count_changes='OFF';"};
+ #else
+   static const char* sqlcmd{
+       "PRAGMA cache_size=4096; PRAGMA synchronous='NORMAL'; PRAGMA count_changes='OFF';"};

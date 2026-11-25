@@ -1,0 +1,52 @@
+# Policy and rationale: docs/GIT-TRACKING.md
+# Build and distribution artifacts
+/build/
+/dist/
+*.pkg
+*.pkg.sha256
+*.self
+*.elf
+*.bin
+*.oelf
+*.gp4
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.pyc
+*.pyo
+__pycache__/
+*.log
+*.raw
+
+# Local tool/agent state
+/.idea/
+/.vscode/
+
+# Third-party checkouts and prebuilt helpers (see scripts/build-pkgtool.sh)
+/tools/LibOrbisPkg-src/
+/tools/liborbispkg/
+
+# The packaging helper needs these runtime libraries; keep them in the repo.
+!tools/ssl-compat/*.so
+!tools/ssl-compat/*.so.*
+
+# Local engine binaries (sources stay tracked)
+/tools/gnm-engine/eboot.bin
+/tools/gnm-engine/gnm_engine
+/tools/gnm-engine/gnm_engine.oelf
+/tools/gnm-engine/src/*.o
+/tools/gnm-engine/sce_module/*.prx
+/tools/gnm-engine/sce_sys/icon0.png
+/tools/gnm-engine/sce_sys/about/right.sprx
+/tools/gnm-engine/glshim/*.o
+/tools/gnm-engine/glshim/*.a
+/tools/gnm-engine/glshim-test/glshim_test
+/tools/gnm-engine/glshim-test/glshim_test.oelf
+/tools/gnm-engine/glshim-test/*.o
+/tools/gnm-engine/glshim-test/*.a
+
+# Kodi source checkout (not vendored)
+/src/kodi/

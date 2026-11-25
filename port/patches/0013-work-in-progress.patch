@@ -1,0 +1,219 @@
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 6c6db4dd73..a922280c28 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -1292,6 +1292,8 @@ void CLinuxRendererGLES::PackVideoToRGBA(int index)
+   if (!m_packedFbo.BeginRender())
+     return;
+ 
++  const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
++
+   CRect savedViewport;
+   m_renderSystem->GetViewPort(savedViewport);
+   glViewport(0, 0, m_sourceWidth, m_sourceHeight);
+@@ -1356,6 +1358,13 @@ void CLinuxRendererGLES::PackVideoToRGBA(int index)
+   glBindTexture(m_textureTarget, 0);
+   m_packedFbo.EndRender();
+   m_renderSystem->SetViewPort(savedViewport);
++
++  /* The GUI relies on GL_SCISSOR_TEST for font/list clipping.  This pass
++   * disables it for the FBO clear, so restore the caller's state; otherwise
++   * off-screen list items (e.g. the menu entry above the focused one) are
++   * painted after playback and look blurred/ghosted. */
++  if (scissorEnabled)
++    glEnable(GL_SCISSOR_TEST);
+ }
+ 
+ void CLinuxRendererGLES::RenderSinglePass(int index, int field)
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index c45a280af3..3533a133a8 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -97,12 +97,22 @@ curl_socket_t PS4OpenSocket(void* /*clientp*/, curlsocktype /*purpose*/,
+   const int one = 1;
+   const int recvBuffer = 256 * 1024;
+   const int sendBuffer = 256 * 1024;
++#ifdef TCP_MAXSEG
++  /* Advertise a conservative MSS.  The PS4 is often behind PPPoE/VPN
++   * (path MTU 1492/1400); a 1460-byte TLS certificate segment that is
++   * silently dropped by the path turns every handshake into a 10 s
++   * retransmission.  1400 keeps the server's segments below that limit. */
++  const int tcpMss = 1400;
++#endif
+   const int keepIdle = 30;
+   const int keepInterval = 10;
+   const int keepCount = 3;
+   (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &recvBuffer, sizeof(recvBuffer));
+   (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sendBuffer, sizeof(sendBuffer));
+   (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++#ifdef TCP_MAXSEG
++  (void)setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &tcpMss, sizeof(tcpMss));
++#endif
+   (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+ #ifdef TCP_KEEPIDLE
+   (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle));
+@@ -122,16 +132,29 @@ curl_socket_t PS4OpenSocket(void* /*clientp*/, curlsocktype /*purpose*/,
+                  {
+                    int actualRecv = 0;
+                    int actualSend = 0;
++#ifdef TCP_MAXSEG
++                   int actualMss = 0;
++#endif
+                    socklen_t length = sizeof(actualRecv);
+                    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actualRecv, &length) != 0)
+                      actualRecv = -1;
+                    length = sizeof(actualSend);
+                    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actualSend, &length) != 0)
+                      actualSend = -1;
++#ifdef TCP_MAXSEG
++                   length = sizeof(actualMss);
++                   if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &actualMss, &length) != 0)
++                     actualMss = -1;
++                   CLog::Log(LOGINFO,
++                             "PS4 net: socket tuning rcvbuf={} sndbuf={} mss={} nodelay=1 "
++                             "keepalive={}/{}/{}",
++                             actualRecv, actualSend, actualMss, keepIdle, keepInterval, keepCount);
++#else
+                    CLog::Log(LOGINFO,
+                              "PS4 net: socket tuning rcvbuf={} sndbuf={} nodelay=1 "
+                              "keepalive={}/{}/{}",
+                              actualRecv, actualSend, keepIdle, keepInterval, keepCount);
++#endif
+                  });
+   return fd;
+ }
+diff --git a/xbmc/platform/posix/main.cpp b/xbmc/platform/posix/main.cpp
+index 7ea4059c6f..ba772cd008 100644
+--- a/xbmc/platform/posix/main.cpp
++++ b/xbmc/platform/posix/main.cpp
+@@ -87,6 +87,12 @@ int main(int argc, char* argv[])
+ 
+   CAppEnvironment::SetUp(appParamParser.GetAppParams());
+ 
++#if defined(TARGET_PS4)
++  // Install the crash handler only after the C++ runtime, logging and the
++  // profile exist; doing it before SetUp() aborts during early startup.
++  InstallPS4CrashHandler();
++#endif
++
+   int status = XBMC_Run(true);
+   /* A failed Create() leaves services only partially initialised; the
+    * settings/environment teardown can then dereference a null object (the
+diff --git a/xbmc/platform/ps4/PlatformFreebsd.cpp b/xbmc/platform/ps4/PlatformFreebsd.cpp
+index 333d41d393..95fca709f0 100644
+--- a/xbmc/platform/ps4/PlatformFreebsd.cpp
++++ b/xbmc/platform/ps4/PlatformFreebsd.cpp
+@@ -28,6 +28,7 @@
+ #include <cstring>
+ #include <exception>
+ #include <iterator>
++#include <new>
+ #include <pthread.h>
+ #include <fcntl.h>
+ #include <sys/resource.h>
+@@ -119,6 +120,96 @@ void WriteStartupTrace(const char*)
+ {
+ }
+ 
++namespace
++{
++
++constexpr const char* kCrashLog = "/data/kodi-ps4/crash.log";
++
++struct CrashBacktrace
++{
++  void* frames[64];
++  int count{0};
++};
++
++_Unwind_Reason_Code CrashBacktraceCallback(_Unwind_Context* context, void* arg)
++{
++  auto* state = static_cast<CrashBacktrace*>(arg);
++  const uintptr_t ip = _Unwind_GetIP(context);
++  if (ip != 0 && state->count < static_cast<int>(std::size(state->frames)))
++    state->frames[state->count++] = reinterpret_cast<void*>(ip);
++  return state->count >= static_cast<int>(std::size(state->frames)) ? _URC_END_OF_STACK
++                                                                   : _URC_NO_REASON;
++}
++
++void PS4CrashWrite(const char* tag, int sig = 0, const void* addr = nullptr)
++{
++  const int fd = open(kCrashLog, O_WRONLY | O_CREAT | O_APPEND, 0644);
++  if (fd < 0)
++    return;
++
++  char line[256];
++  const int n = snprintf(line, sizeof(line), "\n=== %s signal=%d addr=%p thread=%llu ===\n", tag, sig,
++                         addr, static_cast<unsigned long long>(
++                                   reinterpret_cast<uintptr_t>(pthread_self())));
++  if (n > 0)
++    (void)write(fd, line, static_cast<size_t>(n));
++
++  CrashBacktrace state;
++  _Unwind_Backtrace(CrashBacktraceCallback, &state);
++  for (int i = 0; i < state.count; ++i)
++  {
++    const int len = snprintf(line, sizeof(line), "  bt[%02d]=%p\n", i, state.frames[i]);
++    if (len > 0)
++      (void)write(fd, line, static_cast<size_t>(len));
++  }
++  close(fd);
++}
++
++void PS4CrashHandler(int sig, siginfo_t* info, void* /*context*/)
++{
++  PS4CrashWrite("crash", sig, info ? info->si_addr : nullptr);
++  _exit(128 + sig);
++}
++
++void PS4NewHandler()
++{
++  PS4CrashWrite("new_handler");
++  abort();
++}
++
++void PS4TerminateHandler()
++{
++  PS4CrashWrite("terminate");
++  abort();
++}
++
++} // namespace
++
++void InstallPS4CrashHandler()
++{
++  /* Diagnostic switch: create /data/kodi-ps4/crash-handler over FTP (or set
++   * PS4_CRASH_HANDLER=1) before launch.  Release runs stay trace-free. */
++  if (!getenv("PS4_CRASH_HANDLER") && access("/data/kodi-ps4/crash-handler", F_OK) != 0)
++    return;
++
++  static char altstack[64 * 1024];
++  stack_t ss = {};
++  ss.ss_sp = altstack;
++  ss.ss_size = sizeof(altstack);
++  ss.ss_flags = 0;
++  (void)sigaltstack(&ss, nullptr);
++
++  struct sigaction sa = {};
++  sa.__sa_handler.__sa_sigaction = PS4CrashHandler;
++  sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
++  sigemptyset(&sa.sa_mask);
++  for (const int sig : {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE})
++    (void)sigaction(sig, &sa, nullptr);
++
++  std::set_new_handler(PS4NewHandler);
++  std::set_terminate(PS4TerminateHandler);
++}
++
+ void PreparePS4Environment()
+ {
+   // The PS4 does not set HOME, the Kodi profile is kept next to the
+diff --git a/xbmc/platform/ps4/PlatformPs4.h b/xbmc/platform/ps4/PlatformPs4.h
+index e23c877336..90f184437c 100644
+--- a/xbmc/platform/ps4/PlatformPs4.h
++++ b/xbmc/platform/ps4/PlatformPs4.h
+@@ -2,3 +2,4 @@
+ #include "PlatformFreebsd.h"
+ 
+ void PreparePS4Environment();
++void InstallPS4CrashHandler();

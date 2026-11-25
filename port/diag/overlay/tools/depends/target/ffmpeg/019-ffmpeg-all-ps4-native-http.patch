@@ -1,0 +1,647 @@
+From: Kodi PS4 port
+Subject: [PATCH] libavformat: native PS4 HTTP/HTTPS transport via libSceHttp
+
+Route FFmpeg HTTP and HTTPS through the PS4 system HTTP/TLS stack.
+Covers HLS, DASH, progressive MP4 and MPEG-TS over HTTP(S).  One shared
+template avoids per-URL SSL allocations.  The built-in protocols remain
+available when the /data/kodi-ps4/native-http toggle is absent.
+---
+--- a/libavformat/avio.c
++++ b/libavformat/avio.c
+@@ -33,6 +33,11 @@
+ #endif
+ #include "url.h"
+ 
++#if defined(__ORBIS__)
++extern const URLProtocol ff_ps4http_protocol;
++extern const URLProtocol ff_ps4https_protocol;
++extern int PS4NativeHttpsEnabled(void);
++#endif
+ 
+ #define IO_BUFFER_SIZE 32768
+ 
+@@ -325,6 +330,15 @@
+         av_strlcpy(proto_str, filename,
+                    FFMIN(proto_len + 1, sizeof(proto_str)));
+ 
++#if defined(__ORBIS__)
++    if (PS4NativeHttpsEnabled())
++    {
++        if (!strcmp(proto_str, "https"))
++            return &ff_ps4https_protocol;
++        if (!strcmp(proto_str, "http"))
++            return &ff_ps4http_protocol;
++    }
++#endif
+ 
+     av_strlcpy(proto_nested, proto_str, sizeof(proto_nested));
+     if ((ptr = strchr(proto_nested, '+')))
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -698,7 +698,7 @@
+ OBJS-$(CONFIG_GOPHERS_PROTOCOL)          += gopher.o
+ OBJS-$(CONFIG_HTTP_PROTOCOL)             += http.o httpauth.o
+ OBJS-$(CONFIG_HTTPPROXY_PROTOCOL)        += http.o httpauth.o
+-OBJS-$(CONFIG_HTTPS_PROTOCOL)            += http.o httpauth.o
++OBJS-$(CONFIG_HTTPS_PROTOCOL)            += http.o httpauth.o ps4http.o
+ OBJS-$(CONFIG_ICECAST_PROTOCOL)          += icecast.o
+ OBJS-$(CONFIG_MD5_PROTOCOL)              += md5proto.o
+ OBJS-$(CONFIG_MMSH_PROTOCOL)             += mmsh.o mms.o asf_tags.o
+--- /dev/null
++++ b/libavformat/ps4http.c
+@@ -0,0 +1,595 @@
++/*
++ * PS4 native HTTPS protocol for FFmpeg.
++ *
++ * Routes FFmpeg HTTPS opens through libSceHttp/libSceSsl.  The PS4 system
++ * TLS stack is the client accepted by the the live CDN WAF; the OpenSSL and
++ * mbedTLS clients are reset after the media playlist request.
++ *
++ * Enabled from Kodi with /data/kodi-ps4/native-https.  The built-in
++ * FFmpeg HTTPS protocol remains available when the toggle is absent.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++#include "url.h"
++
++#include "libavutil/avstring.h"
++#include "libavutil/dict.h"
++#include "libavutil/error.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++
++#include <inttypes.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <orbis/Http.h>
++#include <orbis/Ssl.h>
++
++extern int32_t PS4HttpGetContextId(void);
++
++static int ps4http_log_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        enabled = (getenv("PS4_HTTP_NATIVE_LOG") != NULL ||
++                   access("/data/kodi-ps4/http-native.log", F_OK) == 0 ||
++                   access("/data/kodi-ps4/native-http", F_OK) == 0 ||
++                   access("/data/kodi-ps4/native-https", F_OK) == 0)
++                      ? 1
++                      : 0;
++    }
++    return enabled;
++}
++
++/* Keep diagnostics out of the hot path when native HTTP is disabled.  The
++ * file is opened per line so a crash cannot leave a stale descriptor and the
++ * O_APPEND write of one short line stays atomic across HLS threads. */
++static void ps4http_log(const char* format, ...)
++{
++    if (!ps4http_log_enabled())
++        return;
++
++    char line[512];
++    const int offset = snprintf(line, sizeof(line), "PS4HTTPNATIVE thread=%llu ",
++                                (unsigned long long)(uintptr_t)pthread_self());
++    if (offset <= 0 || (size_t)offset >= sizeof(line))
++        return;
++
++    va_list args;
++    va_start(args, format);
++    const int length =
++        vsnprintf(line + offset, sizeof(line) - (size_t)offset, format, args);
++    va_end(args);
++    if (length <= 0)
++        return;
++
++    size_t total = (size_t)offset + (size_t)length;
++    if (total >= sizeof(line))
++        total = sizeof(line) - 1;
++    if (total + 1 < sizeof(line))
++        line[total++] = '\n';
++    const int fd = open("/data/kodi-ps4/http-native.log",
++                        O_WRONLY | O_CREAT | O_APPEND, 0644);
++    if (fd >= 0)
++    {
++        (void)write(fd, line, total);
++        close(fd);
++    }
++}
++
++static int32_t g_ps4HttpTemplate = -1;
++static pthread_mutex_t g_ps4HttpTemplateLock = PTHREAD_MUTEX_INITIALIZER;
++
++typedef struct PS4HttpContext
++{
++    int32_t tpl;
++    int32_t conn;
++    int32_t req;
++    int32_t status;
++    int64_t pos;
++    int64_t content_length;
++    int seekable;
++    char* url;
++    char* user_agent;
++    char* cookies;
++    char* referer;
++    char* headers;
++    unsigned reads;
++    uint64_t bytes;
++    int last_error;
++    int eof;
++    int seen_open;
++    uint8_t* read_guard;
++    size_t read_guard_size;
++} PS4HttpContext;
++
++static int ps4http_ssl_verify(int libsslId, unsigned int verifyErr,
++                              void* const sslCert[], int certNum, void* userArg)
++{
++    (void)libsslId;
++    (void)sslCert;
++    (void)certNum;
++    (void)userArg;
++    return verifyErr == 0;
++}
++
++static int32_t ps4http_get_template(int32_t ctx, const char* user_agent, int64_t timeout)
++{
++    pthread_mutex_lock(&g_ps4HttpTemplateLock);
++    if (g_ps4HttpTemplate < 0)
++    {
++        g_ps4HttpTemplate =
++            sceHttpCreateTemplate(ctx, user_agent, ORBIS_HTTP_VERSION_1_1, 1);
++        if (g_ps4HttpTemplate >= 0)
++        {
++            sceHttpsSetSslCallback(g_ps4HttpTemplate, ps4http_ssl_verify, NULL);
++            if (timeout > 0)
++            {
++                sceHttpSetConnectTimeOut(g_ps4HttpTemplate, (uint32_t)timeout);
++                sceHttpSetSendTimeOut(g_ps4HttpTemplate, (uint32_t)timeout);
++                sceHttpSetRecvTimeOut(g_ps4HttpTemplate, (uint32_t)timeout);
++            }
++        }
++    }
++    const int32_t tpl = g_ps4HttpTemplate;
++    pthread_mutex_unlock(&g_ps4HttpTemplateLock);
++    return tpl;
++}
++
++static void ps4http_close_request(PS4HttpContext* s)
++{
++    /* SDK handles are positive; zero is the zeroed priv_data, not a handle.
++     * Deleting handle 0 on the first open corrupted the native state. */
++    if (s->req > 0)
++    {
++        sceHttpDeleteRequest(s->req);
++        s->req = -1;
++    }
++    if (s->conn > 0)
++    {
++        sceHttpDeleteConnection(s->conn);
++        s->conn = -1;
++    }
++}
++
++/* FFmpeg only calls url_close() after a successful url_open2(); free the
++ * per-request strings here when open fails so a rejected segment cannot leak
++ * a URL/cookie block on every HLS rotation. */
++static void ps4http_free_context(PS4HttpContext* s)
++{
++    ps4http_close_request(s);
++    av_freep(&s->url);
++    av_freep(&s->user_agent);
++    av_freep(&s->cookies);
++    av_freep(&s->referer);
++    av_freep(&s->headers);
++    av_freep(&s->read_guard);
++    s->read_guard_size = 0;
++}
++
++static int ps4http_add_headers(PS4HttpContext* s)
++{
++    if (s->cookies && sceHttpAddRequestHeader(s->req, "Cookie", s->cookies, 0) < 0)
++        return AVERROR(EIO);
++    if (s->referer && sceHttpAddRequestHeader(s->req, "Referer", s->referer, 0) < 0)
++        return AVERROR(EIO);
++
++    if (s->headers)
++    {
++        char* copy = av_strdup(s->headers);
++        if (!copy)
++            return AVERROR(ENOMEM);
++        char* line = copy;
++        while (line && *line)
++        {
++            char* eol = strstr(line, "\r\n");
++            if (eol)
++                *eol = '\0';
++            char* colon = strchr(line, ':');
++            if (colon)
++            {
++                *colon = '\0';
++                char* value = colon + 1;
++                while (*value == ' ' || *value == '\t')
++                    value++;
++                if (*line && sceHttpAddRequestHeader(s->req, line, value, 0) < 0)
++                {
++                    av_free(copy);
++                    return AVERROR(EIO);
++                }
++            }
++            line = eol ? eol + 2 : NULL;
++        }
++        av_free(copy);
++    }
++
++    return 0;
++}
++
++static int ps4http_send(PS4HttpContext* s, int64_t range_start)
++{
++    s->eof = 0;
++    ps4http_log("send enter tpl=%d range=%" PRId64 " url=%.160s", s->tpl, range_start,
++                s->url ? s->url : "(null)");
++    const int32_t conn = sceHttpCreateConnectionWithURL(s->tpl, s->url, 1);
++    if (conn < 0)
++    {
++        ps4http_log("send conn error=0x%08x", (unsigned)conn);
++        av_log(NULL, AV_LOG_ERROR, "PS4HTTP connection error 0x%08x\n",
++               (unsigned)conn);
++        return AVERROR(EIO);
++    }
++    s->conn = conn;
++    ps4http_log("send conn=%d range=%" PRId64, conn, range_start);
++
++    const int32_t req = sceHttpCreateRequestWithURL(conn, ORBIS_METHOD_GET, s->url, 0);
++    if (req < 0)
++    {
++        ps4http_log("send request-handle error=0x%08x conn=%d", (unsigned)req, conn);
++        av_log(NULL, AV_LOG_ERROR, "PS4HTTP request error 0x%08x\n", (unsigned)req);
++        return AVERROR(EIO);
++    }
++    s->req = req;
++    ps4http_log("send req=%d conn=%d", req, conn);
++
++    if (range_start > 0)
++    {
++        char range[64];
++        snprintf(range, sizeof(range), "bytes=%" PRId64 "-", range_start);
++        if (sceHttpAddRequestHeader(req, "Range", range, 0) < 0)
++        {
++            ps4http_log("send range-header error req=%d range=%s", req, range);
++            return AVERROR(EIO);
++        }
++    }
++
++    int ret = ps4http_add_headers(s);
++    if (ret < 0)
++    {
++        ps4http_log("send add-headers error=%d req=%d", ret, req);
++        return ret;
++    }
++
++    ps4http_log("send request begin req=%d", req);
++    ret = sceHttpSendRequest(req, NULL, 0);
++    if (ret < 0)
++    {
++        ps4http_log("send request error=0x%08x req=%d", (unsigned)ret, req);
++        av_log(NULL, AV_LOG_ERROR, "PS4HTTP send error 0x%08x\n", (unsigned)ret);
++        return AVERROR(EIO);
++    }
++    ps4http_log("send request done ret=0x%08x req=%d", (unsigned)ret, req);
++
++    s->status = 0;
++    if (sceHttpGetStatusCode(req, &s->status) < 0)
++    {
++        ps4http_log("send status-query error req=%d", req);
++        return AVERROR(EIO);
++    }
++
++    int32_t length_type = 0;
++    size_t length = 0;
++    s->content_length = -1;
++    if (sceHttpGetResponseContentLength(req, &length_type, &length) >= 0 && length > 0)
++        s->content_length = (int64_t)length;
++
++    ps4http_log("send status=%d length=%" PRId64 " range=%" PRId64 " req=%d",
++                s->status, s->content_length, range_start, req);
++    av_log(NULL, AV_LOG_DEBUG,
++           "PS4HTTP open status=%d length=%" PRId64 " range=%" PRId64 "\n",
++           s->status, s->content_length, range_start);
++
++    if (s->status < 200 || s->status >= 300)
++    {
++        ps4http_log("send bad-status=%d req=%d url=%.160s", s->status, req,
++                    s->url ? s->url : "(null)");
++        av_log(NULL, AV_LOG_ERROR, "PS4HTTP status %d for %s\n", s->status, s->url);
++        return AVERROR(EIO);
++    }
++    if (range_start > 0 && s->status == 200)
++    {
++        ps4http_log("send range-ignored req=%d range=%" PRId64, req, range_start);
++        /* The server ignored Range; the caller will have to skip. */
++        return AVERROR(ENOSYS);
++    }
++
++    return 0;
++}
++
++static int ps4http_open2(URLContext* h, const char* url, int flags, AVDictionary** options)
++{
++    PS4HttpContext* s = h->priv_data;
++
++    /* FFmpeg may reuse a URLContext after an error without a close; drop the
++     * previous native handles and strings before overwriting them.  Do not
++     * infer this from req/conn: a fresh zeroed priv_data has req=conn=0, and
++     * deleting handle 0 corrupted the native state on the first open. */
++    if (s->seen_open)
++    {
++        ps4http_log("open reuse old req=%d conn=%d", s->req, s->conn);
++        ps4http_free_context(s);
++    }
++    s->seen_open = 1;
++
++    if (!(flags & AVIO_FLAG_READ))
++        return AVERROR(EINVAL);
++
++    const bool is_https = av_strncasecmp(url, "https://", 8) == 0;
++    const bool is_http = av_strncasecmp(url, "http://", 7) == 0;
++    if (!is_https && !is_http)
++        return AVERROR(EINVAL);
++
++    const int32_t ctx = PS4HttpGetContextId();
++    if (ctx <= 0)
++    {
++        av_log(h, AV_LOG_ERROR, "PS4HTTP native stack not initialised\n");
++        return AVERROR(EIO);
++    }
++
++    s->tpl = -1;
++    s->conn = -1;
++    s->req = -1;
++    s->status = 0;
++    s->pos = 0;
++    s->content_length = -1;
++    s->seekable = 1;
++    s->reads = 0;
++    s->bytes = 0;
++    s->last_error = 0;
++    s->eof = 0;
++
++    ps4http_log("open enter flags=0x%x url=%.200s", flags, url);
++
++    const char* user_agent =
++        "Mozilla/5.0 (PlayStation 4 12.00) AppleWebKit/605.1.15 (KHTML, like Gecko)";
++    int64_t timeout = 0;
++    AVDictionaryEntry* entry = NULL;
++    if (options)
++    {
++        if ((entry = av_dict_get(*options, "user_agent", NULL, 0)) && entry->value)
++            user_agent = entry->value;
++        if ((entry = av_dict_get(*options, "cookies", NULL, 0)) && entry->value)
++        {
++            s->cookies = av_strdup(entry->value);
++            if (!s->cookies)
++            {
++                ps4http_free_context(s);
++                return AVERROR(ENOMEM);
++            }
++        }
++        if ((entry = av_dict_get(*options, "referer", NULL, 0)) && entry->value)
++        {
++            s->referer = av_strdup(entry->value);
++            if (!s->referer)
++            {
++                ps4http_free_context(s);
++                return AVERROR(ENOMEM);
++            }
++        }
++        if ((entry = av_dict_get(*options, "headers", NULL, 0)) && entry->value)
++        {
++            s->headers = av_strdup(entry->value);
++            if (!s->headers)
++            {
++                ps4http_free_context(s);
++                return AVERROR(ENOMEM);
++            }
++        }
++        if ((entry = av_dict_get(*options, "seekable", NULL, 0)) && entry->value)
++            s->seekable = atoi(entry->value) != 0;
++        if ((entry = av_dict_get(*options, "rw_timeout", NULL, 0)) && entry->value)
++            timeout = atoll(entry->value);
++    }
++
++    s->url = av_strdup(url);
++    s->user_agent = av_strdup(user_agent);
++    if (!s->url || !s->user_agent)
++    {
++        ps4http_free_context(s);
++        return AVERROR(ENOMEM);
++    }
++
++    av_log(NULL, AV_LOG_DEBUG, "PS4HTTP open url=%s ua=%s\n", s->url, s->user_agent);
++
++    s->tpl = ps4http_get_template(ctx, s->user_agent, timeout);
++    if (s->tpl < 0)
++    {
++        ps4http_log("open template error=0x%08x url=%.160s", (unsigned)s->tpl, s->url);
++        av_log(h, AV_LOG_ERROR, "PS4HTTP template error 0x%08x\n", (unsigned)s->tpl);
++        ps4http_free_context(s);
++        return AVERROR(EIO);
++    }
++    ps4http_log("open template=%d ctx=%d", s->tpl, ctx);
++
++    int ret = ps4http_send(s, 0);
++    if (ret < 0)
++    {
++        ps4http_log("open send-failed ret=%d url=%.160s", ret, s->url);
++        ps4http_free_context(s);
++        return ret;
++    }
++
++    ps4http_log("open ok req=%d status=%d length=%" PRId64, s->req, s->status,
++                s->content_length);
++    h->is_streamed = s->seekable ? 0 : 1;
++    return 0;
++}
++
++static int ps4http_read(URLContext* h, unsigned char* buf, int size)
++{
++    PS4HttpContext* s = h->priv_data;
++    /* The native read after EOF has been observed to run twice in a row on
++     * HLS segment rotation; cache EOF and close the native request so the
++     * next open starts from a clean handle. */
++    if (s->eof)
++    {
++        ps4http_log("read eof-cached req=%d reads=%u bytes=%" PRIu64 " pos=%" PRId64,
++                    s->req, s->reads, s->bytes, s->pos);
++        return AVERROR_EOF;
++    }
++    if (s->req < 0 || !buf || size <= 0)
++    {
++        ps4http_log("read invalid req=%d buf=%p size=%d", s->req, buf, size);
++        return AVERROR(EIO);
++    }
++    if (h->interrupt_callback.callback &&
++        h->interrupt_callback.callback(h->interrupt_callback.opaque))
++        return AVERROR_EXIT;
++
++    const bool trace = s->reads < 8 || (s->reads % 64) == 0;
++    if (trace)
++        ps4http_log("read begin req=%d size=%d reads=%u pos=%" PRId64, s->req, size,
++                    s->reads, s->pos);
++
++    const size_t guard_bytes = 64;
++    const size_t need = (size_t)size + guard_bytes;
++    if (s->read_guard_size < need)
++    {
++        uint8_t* guard = (uint8_t*)av_realloc(s->read_guard, need);
++        if (!guard)
++        {
++            ps4http_log("read guard alloc failed size=%zu", need);
++            return AVERROR(ENOMEM);
++        }
++        s->read_guard = guard;
++        s->read_guard_size = need;
++    }
++    memset(s->read_guard + size, 0xA5, guard_bytes);
++
++    const int32_t n = sceHttpReadData(s->req, s->read_guard, (uint32_t)size);
++    ++s->reads;
++    if (n >= 0)
++    {
++        for (size_t i = 0; i < guard_bytes; ++i)
++        {
++            if (s->read_guard[(size_t)size + i] != 0xA5)
++            {
++                s->last_error = n;
++                ps4http_log("read GUARD-OVERRUN req=%d n=%d size=%d reads=%u "
++                            "pos=%" PRId64,
++                            s->req, n, size, s->reads, s->pos);
++                av_log(h, AV_LOG_ERROR, "PS4HTTP read guard overrun size=%d\n", size);
++                return AVERROR(EIO);
++            }
++        }
++    }
++    if (n < 0)
++    {
++        s->last_error = n;
++        ps4http_log("read error=0x%08x req=%d size=%d reads=%u pos=%" PRId64,
++                    (unsigned)n, s->req, size, s->reads, s->pos);
++        av_log(h, AV_LOG_ERROR, "PS4HTTP read error 0x%08x\n", (unsigned)n);
++        return AVERROR(EIO);
++    }
++    if (n == 0)
++    {
++        s->eof = 1;
++        ps4http_log("read eof req=%d reads=%u bytes=%" PRIu64 " pos=%" PRId64
++                    " close",
++                    s->req, s->reads, s->bytes, s->pos);
++        ps4http_close_request(s);
++        return AVERROR_EOF;
++    }
++    if (n > size)
++    {
++        /* The system stack must never report more bytes than the caller made
++         * room for; treating it as success would hand FFmpeg a length larger
++         * than the AVIO buffer and let the next copy run past its end. */
++        s->last_error = n;
++        ps4http_log("read OVERRUN req=%d n=%d size=%d reads=%u pos=%" PRId64, s->req,
++                    n, size, s->reads, s->pos);
++        av_log(h, AV_LOG_ERROR, "PS4HTTP read overrun n=%d size=%d\n", n, size);
++        return AVERROR(EIO);
++    }
++
++    memcpy(buf, s->read_guard, (size_t)n);
++    s->bytes += (uint64_t)n;
++    s->pos += n;
++    if (trace)
++        ps4http_log("read done n=%d req=%d reads=%u bytes=%" PRIu64 " pos=%" PRId64, n,
++                    s->req, s->reads, s->bytes, s->pos);
++    return n;
++}
++
++static int64_t ps4http_seek(URLContext* h, int64_t pos, int whence)
++{
++    PS4HttpContext* s = h->priv_data;
++
++    if (whence == AVSEEK_SIZE)
++        return s->content_length >= 0 ? s->content_length : AVERROR(ENOSYS);
++
++    int64_t target;
++    if (whence == SEEK_SET)
++        target = pos;
++    else if (whence == SEEK_CUR)
++        target = s->pos + pos;
++    else if (whence == SEEK_END && s->content_length >= 0)
++        target = s->content_length + pos;
++    else
++        return AVERROR(ENOSYS);
++
++    if (target < 0)
++        return AVERROR(EINVAL);
++    if (target == s->pos)
++        return target;
++    if (!s->seekable)
++        return AVERROR(ENOSYS);
++
++    ps4http_log("seek target=%" PRId64 " whence=%d pos=%" PRId64, target, whence, s->pos);
++    ps4http_close_request(s);
++    s->pos = target;
++
++    const int ret = ps4http_send(s, target);
++    if (ret < 0)
++    {
++        ps4http_log("seek send-failed ret=%d target=%" PRId64, ret, target);
++        return ret;
++    }
++
++    return target;
++}
++
++static int ps4http_close(URLContext* h)
++{
++    PS4HttpContext* s = h->priv_data;
++    ps4http_log("close req=%d conn=%d reads=%u bytes=%" PRIu64 " pos=%" PRId64
++                " err=0x%08x",
++                s->req, s->conn, s->reads, s->bytes, s->pos, (unsigned)s->last_error);
++    ps4http_free_context(s);
++    return 0;
++}
++
++const URLProtocol ff_ps4http_protocol = {
++    .name = "http",
++    .url_open2 = ps4http_open2,
++    .url_read = ps4http_read,
++    .url_seek = ps4http_seek,
++    .url_close = ps4http_close,
++    .priv_data_size = sizeof(PS4HttpContext),
++    .flags = URL_PROTOCOL_FLAG_NETWORK,
++};
++
++const URLProtocol ff_ps4https_protocol = {
++    .name = "https",
++    .url_open2 = ps4http_open2,
++    .url_read = ps4http_read,
++    .url_seek = ps4http_seek,
++    .url_close = ps4http_close,
++    .priv_data_size = sizeof(PS4HttpContext),
++    .flags = URL_PROTOCOL_FLAG_NETWORK,
++};

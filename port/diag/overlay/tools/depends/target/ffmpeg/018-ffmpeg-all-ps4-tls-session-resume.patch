@@ -1,0 +1,328 @@
+--- a/libavformat/tls_mbedtls.c
++++ b/libavformat/tls_mbedtls.c
+@@ -40,9 +40,15 @@
+ #include "internal.h"
+ #include "network.h"
+ #include "url.h"
++
++#include <pthread.h>
+ #include "tls.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/parseutils.h"
++#include "libavutil/time.h"
++
++/* declared in mbedtls/aesni.h (internal, not installed) */
++int mbedtls_aesni_has_support(unsigned int what);
+ #include "libavutil/avstring.h"
+ #include "libavutil/random_seed.h"
+ 
+@@ -265,8 +271,84 @@
+     dtls_srtp_keys srtp_key;
+     struct sockaddr_storage dest_addr;
+     socklen_t dest_addr_len;
++    /* PS4 session-resumption state */
++    int ps4_resumed;
++    int ps4_handshaking;
++    struct PS4CaEntry *ps4_ca_entry;
+ } TLSContext;
+ 
++/* PS4: reconnects are expensive on a lossy link, so keep two
++ * process-wide caches: the parsed CA chain (a large PEM otherwise
++ * parsed on every open) and the last client session per host (a
++ * resumed handshake is one round trip instead of a full one).
++ *
++ * The CA chain is reference-counted because its ownership is shared
++ * between the cache slot and every open TLS context: retiring the
++ * cached entry (CA file change) or closing a context only frees the
++ * chain when the last reference is gone, so a handshake can never be
++ * handed a freed chain.  The session cache retains up to 16 hosts (LRU)
++ * so streams with separate playlist/segment CDN hostnames do not
++ * thrash each other out of the cache. */
++#define PS4_TLS_SESSION_CACHE_SIZE 16
++
++typedef struct PS4SessionEntry {
++    char *host;
++    mbedtls_ssl_session *session;
++    uint32_t last_used;
++} PS4SessionEntry;
++
++typedef struct PS4CaEntry {
++    mbedtls_x509_crt certs;        /* parsed CA chain, owned here */
++    int refs;                      /* cache slot + live TLS contexts */
++} PS4CaEntry;
++
++static pthread_mutex_t ps4_tls_cache_lock = PTHREAD_MUTEX_INITIALIZER;
++static PS4SessionEntry ps4_tls_sessions[PS4_TLS_SESSION_CACHE_SIZE];
++static uint32_t ps4_tls_session_clock;
++static PS4CaEntry *ps4_tls_cache_ca;
++static char *ps4_tls_cache_ca_file;
++
++static void ps4_tls_drop_session_cache(const char *host)
++{
++    pthread_mutex_lock(&ps4_tls_cache_lock);
++    for (int i = 0; i < PS4_TLS_SESSION_CACHE_SIZE; i++) {
++        if (ps4_tls_sessions[i].host && (!host || !strcmp(ps4_tls_sessions[i].host, host))) {
++            av_free(ps4_tls_sessions[i].host);
++            ps4_tls_sessions[i].host = NULL;
++            if (ps4_tls_sessions[i].session) {
++                mbedtls_ssl_session_free(ps4_tls_sessions[i].session);
++                av_free(ps4_tls_sessions[i].session);
++                ps4_tls_sessions[i].session = NULL;
++            }
++            ps4_tls_sessions[i].last_used = 0;
++            if (host)
++                break;
++        }
++    }
++    pthread_mutex_unlock(&ps4_tls_cache_lock);
++}
++
++/* Release this context's reference to the cached CA chain.  The
++ * cache slot holds its own reference, so a cached chain is only
++ * freed here once it has been retired from the cache. */
++static void ps4_tls_release_ca(TLSContext *tls_ctx)
++{
++    PS4CaEntry *doomed = NULL;
++
++    pthread_mutex_lock(&ps4_tls_cache_lock);
++    if (tls_ctx->ps4_ca_entry) {
++        if (--tls_ctx->ps4_ca_entry->refs == 0)
++            doomed = tls_ctx->ps4_ca_entry;
++        tls_ctx->ps4_ca_entry = NULL;
++    }
++    pthread_mutex_unlock(&ps4_tls_cache_lock);
++
++    if (doomed) {
++        mbedtls_x509_crt_free(&doomed->certs);
++        av_free(doomed);
++    }
++}
++
+ int ff_tls_set_external_socket(URLContext *h, URLContext *sock)
+ {
+     TLSContext *tls_ctx = h->priv_data;
+@@ -337,6 +419,7 @@
+ 
+     mbedtls_ssl_close_notify(&tls_ctx->ssl_context);
+     mbedtls_pk_free(&tls_ctx->priv_key);
++    ps4_tls_release_ca(tls_ctx);
+     mbedtls_x509_crt_free(&tls_ctx->ca_cert);
+     mbedtls_x509_crt_free(&tls_ctx->own_cert);
+     mbedtls_ssl_free(&tls_ctx->ssl_context);
+@@ -370,7 +453,11 @@
+     TLSContext *tls_ctx = (TLSContext*) ctx;
+     TLSShared *shr = &tls_ctx->tls_shared;
+     URLContext *h = shr->is_dtls ? shr->udp : shr->tcp;
+-    int ret = ffurl_write(h, buf, len);
++    int ret;
++    if (tls_ctx->ps4_handshaking)
++        av_log(h, AV_LOG_DEBUG, "PS4TLS: io send t=%lld len=%d\n",
++               (long long)av_gettime_relative(), (int)len);
++    ret = ffurl_write(h, buf, len);
+     if (ret >= 0)
+         return ret;
+ 
+@@ -385,7 +472,14 @@
+     TLSContext *tls_ctx = (TLSContext*) ctx;
+     TLSShared *shr = &tls_ctx->tls_shared;
+     URLContext *h = shr->is_dtls ? shr->udp : shr->tcp;
+-    int ret = ffurl_read(h, buf, len);
++    int ret;
++    if (tls_ctx->ps4_handshaking)
++        av_log(h, AV_LOG_DEBUG, "PS4TLS: io recv-begin t=%lld len=%d\n",
++               (long long)av_gettime_relative(), (int)len);
++    ret = ffurl_read(h, buf, len);
++    if (tls_ctx->ps4_handshaking)
++        av_log(h, AV_LOG_DEBUG, "PS4TLS: io recv-end t=%lld ret=%d\n",
++               (long long)av_gettime_relative(), ret);
+     if (ret >= 0) {
+ #if CONFIG_UDP_PROTOCOL
+         if (shr->is_dtls && shr->listen && !tls_ctx->dest_addr_len) {
+@@ -556,10 +650,62 @@
+     if (!ca_file)
+         ca_file = getenv("SSL_CERT_FILE");
+     if (ca_file) {
+-        if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, ca_file)) != 0) {
+-            av_log(h, AV_LOG_ERROR, "mbedtls_x509_crt_parse_file for CA cert returned %d\n", ret);
+-            goto fail;
++        PS4CaEntry *entry = NULL;
++
++        /* Cache hit: take a reference for this context.  The chain
++         * outlives the context and tls_ctx->ca_cert stays zeroed, so
++         * tls_close frees nothing on this path. */
++        pthread_mutex_lock(&ps4_tls_cache_lock);
++        if (ps4_tls_cache_ca && ps4_tls_cache_ca_file &&
++            !strcmp(ps4_tls_cache_ca_file, ca_file)) {
++            entry = ps4_tls_cache_ca;
++            entry->refs++;
++        }
++        pthread_mutex_unlock(&ps4_tls_cache_lock);
++
++        if (!entry) {
++            /* Cache miss: parse into a reference-counted entry so the
++             * ownership can move to the cache without any shallow
++             * copy of the parsed chain. */
++            entry = av_mallocz(sizeof(*entry));
++            if (entry) {
++                mbedtls_x509_crt_init(&entry->certs);
++                if ((ret = mbedtls_x509_crt_parse_file(&entry->certs, ca_file)) != 0) {
++                    av_log(h, AV_LOG_ERROR, "mbedtls_x509_crt_parse_file for CA cert returned %d\n", ret);
++                    av_free(entry);
++                    goto fail;
++                }
++                char *file = av_strdup(ca_file);
++                if (file) {
++                    PS4CaEntry *doomed = NULL;
++
++                    entry->refs = 2;    /* cache slot + this context */
++                    pthread_mutex_lock(&ps4_tls_cache_lock);
++                    if (ps4_tls_cache_ca && --ps4_tls_cache_ca->refs == 0)
++                        doomed = ps4_tls_cache_ca;
++                    ps4_tls_cache_ca = entry;
++                    av_free(ps4_tls_cache_ca_file);
++                    ps4_tls_cache_ca_file = file;
++                    pthread_mutex_unlock(&ps4_tls_cache_lock);
++                    if (doomed) {
++                        mbedtls_x509_crt_free(&doomed->certs);
++                        av_free(doomed);
++                    }
++                } else {
++                    /* strdup failed: this context is the sole owner
++                     * of the parsed chain. */
++                    entry->refs = 1;
++                }
++            } else {
++                /* Allocation failed: upstream behaviour, the context
++                 * owns and frees ca_cert itself. */
++                if ((ret = mbedtls_x509_crt_parse_file(&tls_ctx->ca_cert, ca_file)) != 0) {
++                    av_log(h, AV_LOG_ERROR, "mbedtls_x509_crt_parse_file for CA cert returned %d\n", ret);
++                    goto fail;
++                }
++            }
+         }
++        tls_ctx->ps4_ca_entry = entry;
+     }
+ 
+     // load own certificate
+@@ -649,7 +795,9 @@
+     mbedtls_ssl_conf_authmode(&tls_ctx->ssl_config,
+                               shr->verify ? MBEDTLS_SSL_VERIFY_OPTIONAL : MBEDTLS_SSL_VERIFY_NONE);
+     mbedtls_ssl_conf_rng(&tls_ctx->ssl_config, mbedtls_ctr_drbg_random, &tls_ctx->ctr_drbg_context);
+-    mbedtls_ssl_conf_ca_chain(&tls_ctx->ssl_config, &tls_ctx->ca_cert, NULL);
++    mbedtls_ssl_conf_ca_chain(&tls_ctx->ssl_config,
++                              tls_ctx->ps4_ca_entry ? &tls_ctx->ps4_ca_entry->certs : &tls_ctx->ca_cert,
++                              NULL);
+ 
+     // set own certificate and private key
+     if ((ret = mbedtls_ssl_conf_own_cert(&tls_ctx->ssl_config, &tls_ctx->own_cert, &tls_ctx->priv_key)) != 0) {
+@@ -693,10 +841,44 @@
+         if (shr->mtu)
+             mbedtls_ssl_set_mtu(&tls_ctx->ssl_context, shr->mtu);
+     }
++
++    if (!shr->listen && !shr->is_dtls && shr->host) {
++        pthread_mutex_lock(&ps4_tls_cache_lock);
++        for (int i = 0; i < PS4_TLS_SESSION_CACHE_SIZE; i++) {
++            if (ps4_tls_sessions[i].host && !strcmp(ps4_tls_sessions[i].host, shr->host)) {
++                if (ps4_tls_sessions[i].session &&
++                    mbedtls_ssl_set_session(&tls_ctx->ssl_context, ps4_tls_sessions[i].session) == 0) {
++                    tls_ctx->ps4_resumed = 1;
++                    ps4_tls_sessions[i].last_used = ++ps4_tls_session_clock;
++                }
++                break;
++            }
++        }
++        pthread_mutex_unlock(&ps4_tls_cache_lock);
++    }
++
+     if (!shr->external_sock) {
++        int64_t ps4_t0 = av_gettime_relative();
++        tls_ctx->ps4_handshaking = 1;
++        av_log(h, AV_LOG_INFO, "PS4TLS: handshake-start t=%lld host=%s resumed=%d\n",
++               (long long)ps4_t0, shr->host ? shr->host : "?", tls_ctx->ps4_resumed);
+         ret = tls_handshake(h);
+-        if (ret < 0)
+-            goto fail;
++        tls_ctx->ps4_handshaking = 0;
++        av_log(h, AV_LOG_INFO, "PS4TLS: handshake-end t=%lld elapsed_us=%lld rc=%d ver=%s cipher=%s\n",
++               (long long)av_gettime_relative(),
++               (long long)(av_gettime_relative() - ps4_t0), ret,
++               mbedtls_ssl_get_version(&tls_ctx->ssl_context),
++               mbedtls_ssl_get_ciphersuite(&tls_ctx->ssl_context));
++        if (ret < 0) {
++            if (tls_ctx->ps4_resumed)
++                ps4_tls_drop_session_cache(shr->host);
++            goto fail;
++        }
++        av_log(h, AV_LOG_INFO, "PS4TLS: %s handshake to %s\n",
++               tls_ctx->ps4_resumed ? "resumed" : "full",
++               shr->host ? shr->host : "?");
++        av_log(h, AV_LOG_INFO, "PS4TLS: AES-NI=%d (TLS CPU bottleneck if 0)\n",
++               mbedtls_aesni_has_support(0x2000000));
+     }
+ 
+     if (shr->verify) {
+@@ -711,6 +893,63 @@
+         }
+     }
+ 
++    if (!shr->listen && !shr->is_dtls && shr->host) {
++        mbedtls_ssl_session *session = av_mallocz(sizeof(*session));
++        if (session) {
++            mbedtls_ssl_session_init(session);
++            if (mbedtls_ssl_get_session(&tls_ctx->ssl_context, session) == 0) {
++                char *host = av_strdup(shr->host);
++                if (host) {
++                    pthread_mutex_lock(&ps4_tls_cache_lock);
++                    int slot = -1;
++                    uint32_t oldest = UINT32_MAX;
++                    int empty_slot = -1;
++                    for (int i = 0; i < PS4_TLS_SESSION_CACHE_SIZE; i++) {
++                        if (ps4_tls_sessions[i].host && !strcmp(ps4_tls_sessions[i].host, host)) {
++                            slot = i;
++                            break;
++                        }
++                        if (!ps4_tls_sessions[i].host && empty_slot < 0) {
++                            empty_slot = i;
++                        } else if (ps4_tls_sessions[i].host && ps4_tls_sessions[i].last_used < oldest) {
++                            oldest = ps4_tls_sessions[i].last_used;
++                        }
++                    }
++                    if (slot < 0) {
++                        if (empty_slot >= 0) {
++                            slot = empty_slot;
++                        } else {
++                            for (int i = 0; i < PS4_TLS_SESSION_CACHE_SIZE; i++) {
++                                if (ps4_tls_sessions[i].last_used == oldest) {
++                                    slot = i;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    if (slot >= 0) {
++                        av_free(ps4_tls_sessions[slot].host);
++                        if (ps4_tls_sessions[slot].session) {
++                            mbedtls_ssl_session_free(ps4_tls_sessions[slot].session);
++                            av_free(ps4_tls_sessions[slot].session);
++                        }
++                        ps4_tls_sessions[slot].host = host;
++                        ps4_tls_sessions[slot].session = session;
++                        ps4_tls_sessions[slot].last_used = ++ps4_tls_session_clock;
++                        session = NULL;
++                        host = NULL;
++                    }
++                    pthread_mutex_unlock(&ps4_tls_cache_lock);
++                    av_free(host);
++                }
++            }
++            if (session) {
++                mbedtls_ssl_session_free(session);
++                av_free(session);
++            }
++        }
++    }
++
+     return 0;
+ 
+ fail:

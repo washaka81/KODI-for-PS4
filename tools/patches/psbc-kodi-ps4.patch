@@ -1,0 +1,294 @@
+diff --git a/cmd/psbc/main.c b/cmd/psbc/main.c
+index b21c323..bc95c7a 100644
+--- a/cmd/psbc/main.c
++++ b/cmd/psbc/main.c
+@@ -235,13 +235,35 @@ static void buildsb(
+ 	if (ctx->rargs->descriptor_sets[0].used) {
+ 		numinputslots += 1;
+ 	}
++	if (ctx->rargs->ac.push_constants.used) {
++		numinputslots += 1;
++	}
++
++	// GNM stores a second copy of the input usage slots immediately before
++	// GnmShaderBinaryInfo, followed by the chunk usage masks and a two-dword
++	// footer (1, 0xBEEF).  Piglet/LCUE read them backwards from
++	// m_chunkUsageBaseOffsetInDW; without the copy the vertex fetch setup
++	// reads code bytes as usage slots and no attribute becomes active.
++	uint32_t num_masks = 0;
++	if (ctx->stage == MESA_SHADER_VERTEX &&
++	    ctx->rargs->ac.vertex_buffers.used) {
++		num_masks = 1;
++	}
++	const uint32_t tail_size =
++	    numinputslots * sizeof(GnmInputUsageSlot) +
++	    num_masks * sizeof(uint32_t) + 2 * sizeof(uint32_t);
++	const uint32_t total_code_size = codesize + tail_size;
+ 
+ 	uint32_t shspecificsize = headershsize(ctx->stage);
+ 	shspecificsize += numinputslots * sizeof(GnmInputUsageSlot);
+ 
+-	// exclude position as it doesn't count as an export semantic in PSB
++	// User varyings live at VARYING_SLOT_VAR0 (32) and above; built-ins
++	// such as gl_Position/gl_FragCoord live below.  The PSSL/GNM semantic
++	// numbering starts at 15 for location 0.
+ 	const uint32_t outputswritten =
+-	    util_bitcount64(ctx->nir->info.outputs_written & ~VARYING_BIT_POS);
++	    util_bitcount64(ctx->nir->info.outputs_written >> VARYING_SLOT_VAR0);
++	const uint32_t inputswritten =
++	    util_bitcount64(ctx->nir->info.inputs_read >> VARYING_SLOT_VAR0);
+ 
+ 	switch (ctx->stage) {
+ 	case MESA_SHADER_VERTEX:
+@@ -251,8 +273,7 @@ static void buildsb(
+ 		    outputswritten * sizeof(GnmVertexExportSemantic);
+ 		break;
+ 	case MESA_SHADER_FRAGMENT:
+-		shspecificsize += util_bitcount64(ctx->nir->info.inputs_read) *
+-				  sizeof(GnmPixelInputSemantic);
++		shspecificsize += inputswritten * sizeof(GnmPixelInputSemantic);
+ 		break;
+ 	default:
+ 		break;
+@@ -270,7 +291,7 @@ static void buildsb(
+ 	    .codetype = PSSL_CODE_ISA,
+ 	    .compilertype = PSSL_COMPILER_UNSPECIFIED,
+ 	    .codesize = sizeof(GnmShaderFileHeader) + shspecificsize +
+-			codesize + sizeof(GnmShaderBinaryInfo),
++			total_code_size + sizeof(GnmShaderBinaryInfo),
+ 	};
+ 	fwrite(&psbh, 1, sizeof(psbh), h);
+ 
+@@ -301,7 +322,7 @@ static void buildsb(
+ 		    .common =
+ 			{
+ 			    .shadersize =
+-				codesize + sizeof(GnmShaderBinaryInfo),
++				total_code_size + sizeof(GnmShaderBinaryInfo),
+ 			    .numinputusageslots = numinputslots,
+ 			},
+ 		    .registers =
+@@ -378,7 +399,7 @@ static void buildsb(
+ 		    .common =
+ 			{
+ 			    .shadersize =
+-				codesize + sizeof(GnmShaderBinaryInfo),
++				total_code_size + sizeof(GnmShaderBinaryInfo),
+ 			    .numinputusageslots = numinputslots,
+ 			},
+ 		    .registers =
+@@ -414,8 +435,7 @@ static void buildsb(
+ 				ctx->acinfo->ps.epilog.spi_shader_col_format
+ 			    ),
+ 			},
+-		    .numinputsemantics =
+-			util_bitcount64(ctx->nir->info.inputs_read),
++		    .numinputsemantics = inputswritten,
+ 		};
+ 		fwrite(&psh, 1, sizeof(psh), h);
+ 		break;
+@@ -425,6 +445,8 @@ static void buildsb(
+ 	}
+ 
+ 	// write shader common data
++	GnmInputUsageSlot usage_slots[32] = {0};
++	uint32_t usage_count = 0;
+ 	if (ctx->rargs->prolog_inputs.used) {
+ 		const GnmInputUsageSlot s = {
+ 		    .usagetype = GNM_SHINPUTUSAGE_SUBPTR_FETCHSHADER,
+@@ -432,7 +454,9 @@ static void buildsb(
+ 			ctx->rargs->ac.args[ctx->rargs->prolog_inputs.arg_index]
+ 			    .offset,
+ 		};
+-		fwrite(&s, 1, sizeof(s), h);
++		usage_slots[usage_count] = s;
++		fwrite(&usage_slots[usage_count], 1, sizeof(s), h);
++		usage_count++;
+ 	}
+ 	if (ctx->rargs->ac.vertex_buffers.used) {
+ 		const GnmInputUsageSlot s = {
+@@ -441,8 +465,12 @@ static void buildsb(
+ 			ctx->rargs->ac
+ 			    .args[ctx->rargs->ac.vertex_buffers.arg_index]
+ 			    .offset,
++		    // one chunk mask dword follows the usage-slot copy
++		    .chunkmask = 1,
+ 		};
+-		fwrite(&s, 1, sizeof(s), h);
++		usage_slots[usage_count] = s;
++		fwrite(&usage_slots[usage_count], 1, sizeof(s), h);
++		usage_count++;
+ 	}
+ 	// TODO: have this work with multiple sets
+ 	if (ctx->rargs->descriptor_sets[0].used) {
+@@ -453,46 +481,81 @@ static void buildsb(
+ 			    .args[ctx->rargs->descriptor_sets[0].arg_index]
+ 			    .offset,
+ 		};
+-		fwrite(&s, 1, sizeof(s), h);
++		usage_slots[usage_count] = s;
++		fwrite(&usage_slots[usage_count], 1, sizeof(s), h);
++		usage_count++;
++	}
++	if (ctx->rargs->ac.push_constants.used) {
++		const GnmInputUsageSlot s = {
++		    .usagetype = GNM_SHINPUTUSAGE_IMM_CONSTBUFFER,
++		    .startregister =
++			ctx->rargs->ac
++			    .args[ctx->rargs->ac.push_constants.arg_index]
++			    .offset,
++		};
++		usage_slots[usage_count] = s;
++		fwrite(&usage_slots[usage_count], 1, sizeof(s), h);
++		usage_count++;
++	}
++	if (usage_count != numinputslots) {
++		fatalf("usage slot count mismatch (%u != %u)", usage_count,
++		       numinputslots);
+ 	}
+ 
+ 	switch (ctx->stage) {
+-	case MESA_SHADER_VERTEX:
+-		for (uint32_t i = 0;
+-		     i < util_bitcount64(ctx->nir->info.inputs_read); i += 1) {
++	case MESA_SHADER_VERTEX: {
++		uint32_t input_index = 0;
++		for (uint32_t loc = 0; loc < 32; loc += 1) {
++			if (!(ctx->nir->info.inputs_read & (1ull << loc))) {
++				continue;
++			}
+ 			const GnmVertexInputSemantic input = {
+-			    .semantic = i,
++			    .semantic =
++				loc >= VERT_ATTRIB_GENERIC0
++				    ? loc - VERT_ATTRIB_GENERIC0
++				    : loc,
+ 			    .vgpr =
+ 				ctx->rargs->ac
+-				    .args[ctx->rargs->vs_inputs[i].arg_index]
++				    .args[ctx->rargs->vs_inputs[input_index]
++					      .arg_index]
+ 				    .offset,
+ 			    .sizeinelements =
+ 				ctx->rargs->ac
+-				    .args[ctx->rargs->vs_inputs[i].arg_index]
++				    .args[ctx->rargs->vs_inputs[input_index]
++					      .arg_index]
+ 				    .size,
+ 			};
++			input_index++;
+ 			fwrite(&input, 1, sizeof(input), h);
+ 		}
+-		for (uint32_t i = 0; i < outputswritten; i += 1) {
++		const uint64_t export_mask =
++		    ctx->nir->info.outputs_written >> VARYING_SLOT_VAR0;
++		uint32_t outindex = 0;
++		for (uint32_t i = 0; i < 32; i += 1) {
++			if (!(export_mask & (1ull << i))) {
++				continue;
++			}
+ 			// VS exports/PS inputs semantic index seems to start
+ 			// at 15. this is to be compatible with official SDK
+-			// shaders
+-			// TODO: make sure this is the case
++			// shaders.  Keep the semantic derived from the
++			// varying's location so FS shaders that consume a
++			// subset of the VS outputs still match.
+ 			const GnmVertexExportSemantic out = {
+ 			    .semantic = 15 + i,
+-			    .outindex = i,
++			    .outindex = outindex++,
+ 			    .exportf16 = 0,
+ 			};
+ 			fwrite(&out, 1, sizeof(out), h);
+ 		}
+ 		break;
+-	case MESA_SHADER_FRAGMENT:
+-		for (uint32_t i = 0;
+-		     i < util_bitcount64(ctx->nir->info.inputs_read); i += 1) {
+-			// VS exports/PS inputs semantic index seems to start
+-			// at 15. this is to be compatible with official SDK
+-			// shaders
+-			// TODO: make sure this is the case
++	}
++	case MESA_SHADER_FRAGMENT: {
++		const uint64_t input_mask =
++		    ctx->nir->info.inputs_read >> VARYING_SLOT_VAR0;
++		for (uint32_t i = 0; i < 32; i += 1) {
++			if (!(input_mask & (1ull << i))) {
++				continue;
++			}
+ 			const GnmPixelInputSemantic input = {
+ 			    .semantic = 15 + i,
+ 			    // TODO: do other values need to be filled?
+@@ -500,6 +563,7 @@ static void buildsb(
+ 			fwrite(&input, 1, sizeof(input), h);
+ 		}
+ 		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -510,8 +574,27 @@ static void buildsb(
+ 		fwrite(&val, 1, sizeof(val), h);
+ 	}
+ 
+-	// shader code
+-	fwrite(newcode, 1, codesize, h);
++	// shader code + second usage-slot copy + chunk masks + footer
++	uint32_t* fullcode = malloc(total_code_size);
++	if (!fullcode) {
++		fatalf("Failed to allocate the shader binary");
++	}
++	memcpy(fullcode, newcode, codesize);
++	uint8_t* tail = (uint8_t*)fullcode + codesize;
++	memcpy(tail, usage_slots, usage_count * sizeof(GnmInputUsageSlot));
++	tail += usage_count * sizeof(GnmInputUsageSlot);
++	if (num_masks) {
++		const uint32_t vbmask =
++		    (uint32_t)((ctx->nir->info.inputs_read >>
++				VERT_ATTRIB_GENERIC0) &
++			       0x1f);
++		memcpy(tail, &vbmask, sizeof(vbmask));
++		tail += sizeof(vbmask);
++	}
++	const uint32_t footer[2] = {1, 0xBEEF};
++	memcpy(tail, footer, sizeof(footer));
++
++	fwrite(fullcode, 1, total_code_size, h);
+ 
+ 	GnmShaderBinaryInfo bininfo = {
+ 	    .signature = GNM_SHADER_BINARY_INFO_MAGIC,
+@@ -519,14 +602,17 @@ static void buildsb(
+ 
+ 	    .ispsslcg = 1,
+ 	    .type = shbintype(ctx->stage),
+-	    .length = codesize,
++	    .length = total_code_size,
++	    .chunkusagebaseoffsetdwords = num_masks + 2,
++	    .numinputusageslots = numinputslots,
+ 	};
+-	bininfo.crc32 = hashsb(newcode, codesize, &bininfo);
++	bininfo.crc32 = hashsb(fullcode, total_code_size, &bininfo);
+ 	fwrite(&bininfo, 1, sizeof(bininfo), h);
+ 
+ 	const PsslBinaryParamInfo paraminfo = {0};
+ 	fwrite(&paraminfo, 1, sizeof(paraminfo), h);
+ 
++	free(fullcode);
+ 	free(newcode);
+ 	fclose(h);
+ }
+@@ -689,6 +775,12 @@ int main(int argc, char** argv) {
+ 	    gfxlevel, chipfamily, nir, MESA_SHADER_NONE, false, &rshinfo
+ 	);
+ 
++	// Always address the PSSL __GLOBAL_CB__ through a user-SGPR pointer
++	// (IMM_CONSTBUFFER).  If RADV inlines small push-constant blocks into
++	// SGPRs, Piglet has no usage slot to feed them from glUniform*.
++	rshinfo.can_inline_all_push_constants = false;
++	rshinfo.inline_push_constant_mask = 0;
++
+ 	struct radv_shader_args rshargs = {0};
+ 	radv_declare_shader_args(
+ 	    gfxlevel, &rshinfo, opts.stage, MESA_SHADER_NONE, &rshargs

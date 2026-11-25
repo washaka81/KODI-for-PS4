@@ -1,0 +1,138 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -806,6 +806,9 @@
+ 	*-*-vxworks*)
+ 		_host_ident=$host_cpu
+ 		;;
++	*-*-freebsd*)
++		_host_ident=$host_cpu
++		;;
+ 	*-*-emscripten)
+ 		_host_ident=$(emcc -dumpversion | cut -f1 -d-)-$host_cpu
+ 		;;
+--- a/configure
++++ b/configure
+@@ -4130,6 +4130,9 @@
+ 	*-*-wasi*)
+ 	    ac_sys_system=WASI
+ 	    ;;
++	*-*-freebsd*)
++	    ac_sys_system=FreeBSD
++	    ;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
+@@ -4628,6 +4631,9 @@
+ 	*-*-vxworks*)
+ 		_host_ident=$host_cpu
+ 		;;
++	*-*-freebsd*)
++		_host_ident=$host_cpu
++		;;
+ 	*-*-emscripten)
+ 		_host_ident=$(emcc -dumpversion | cut -f1 -d-)-$host_cpu
+ 		;;
+--- a/Objects/mimalloc/prim/unix/prim.c
++++ b/Objects/mimalloc/prim/unix/prim.c
+@@ -114,7 +114,7 @@
+       os_overcommit = (buf[0] == '0' || buf[0] == '1');
+     }
+   }
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__ORBIS__)
+   int val = 0;
+   size_t olen = sizeof(val);
+   if (sysctlbyname("vm.overcommit", &val, &olen, NULL, 0) == 0) {
+@@ -498,7 +498,7 @@
+   return (node+1);
+ }
+ 
+-#elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000
++#elif defined(__FreeBSD__) && !defined(__ORBIS__) && __FreeBSD_version >= 1200000
+ 
+ size_t _mi_prim_numa_node(void) {
+   domainset_t dom;
+@@ -750,8 +750,8 @@
+ }
+ 
+ #elif defined(__ANDROID__) || defined(__DragonFly__) || \
+-      defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
+-      defined(__sun)
++      (defined(__FreeBSD__) && !defined(__ORBIS__)) || defined(__NetBSD__) || \
++      defined(__OpenBSD__) || defined(__sun)
+ 
+ #include <stdlib.h>
+ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
+@@ -759,6 +759,13 @@
+   return true;
+ }
+ 
++#elif defined(__ORBIS__)
++
++#include <unistd.h>
++bool _mi_prim_random_buf(void* buf, size_t buf_len) {
++  return getentropy(buf, buf_len) == 0;
++}
++
+ #elif defined(__linux__) || defined(__HAIKU__)
+ 
+ #include <sys/types.h>
+--- a/Python/gc_free_threading.c
++++ b/Python/gc_free_threading.c
+@@ -27,7 +27,7 @@
+     #include <mach/mach.h>
+     #include <mach/task.h> // Required for TASK_VM_INFO
+     #include <unistd.h> // For sysconf, getpid
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__ORBIS__)
+     #include <sys/types.h>
+     #include <sys/sysctl.h>
+     #include <sys/user.h> // Requires sys/user.h for kinfo_proc definition
+--- a/Python/thread_pthread.h
++++ b/Python/thread_pthread.h
+@@ -20,7 +20,7 @@
+ 
+ #if defined(__linux__)
+ #   include <sys/syscall.h>     /* syscall(SYS_gettid) */
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__ORBIS__)
+ #   include <pthread_np.h>      /* pthread_getthreadid_np() */
+ #elif defined(__FreeBSD_kernel__)
+ #   include <sys/syscall.h>     /* syscall(SYS_thr_self) */
+@@ -391,6 +391,9 @@
+ #elif defined(__linux__)
+     pid_t native_id;
+     native_id = syscall(SYS_gettid);
++#elif defined(__ORBIS__)
++    unsigned long native_id;
++    native_id = (unsigned long)pthread_self();
+ #elif defined(__FreeBSD__)
+     int native_id;
+     native_id = pthread_getthreadid_np();
+--- a/Modules/posixmodule.c
++++ b/Modules/posixmodule.c
+@@ -16395,7 +16395,12 @@
+             PyObject *module = PyType_GetModule(Py_TYPE(iterator));
+             entry = DirEntry_from_posix_info(module,
+                                              &iterator->path, direntp->d_name,
+-                                             name_len, direntp->d_ino
++                                             name_len,
++#ifdef __ORBIS__
++                                             0
++#else
++                                             direntp->d_ino
++#endif
+ #ifdef HAVE_DIRENT_D_TYPE
+                                              , direntp->d_type
+ #endif
+--- a/Modules/_hacl/Lib_Memzero0.c
++++ b/Modules/_hacl/Lib_Memzero0.c
+@@ -6,6 +6,8 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#else
++#include <string.h>
+ #endif
+ 
+ #if defined(__APPLE__) && defined(__MACH__)

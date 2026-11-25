@@ -1,0 +1,1974 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:36 -0300
+Subject: [PATCH 03/12] ps4: GLES/EGL windowing and shader translator
+
+Implement the Piglet EGL window system, precompiled PSSL shader loading and the PS4 YUV pack path. Add the font/text ABI fixes required by the Orbis libc++.
+---
+ system/shaders/GLES/2.0/gles_pack.frag        |  16 +
+ .../shaders/GLES/2.0/gles_yuv2rgb_basic.frag  |  31 +-
+ system/shaders/GLES/2.0/gles_yuv2rgb_bob.frag |  23 +-
+ .../cores/VideoPlayer/Process/ProcessInfo.cpp |   5 +
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |   6 +-
+ .../VideoRenderers/BaseRenderer.cpp           |   6 +-
+ .../VideoPlayer/VideoRenderers/CMakeLists.txt |   1 +
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 250 ++++++++++--
+ .../VideoRenderers/LinuxRendererGLES.h        |  12 +
+ .../VideoShaders/CMakeLists.txt               |   1 +
+ .../VideoShaders/ShaderFormats.h              |   2 +
+ .../VideoShaders/YUV2RGBShaderGLES.cpp        |   2 +
+ xbmc/guilib/GUIEditControl.cpp                |  23 ++
+ xbmc/guilib/GUIEditControl.h                  |   2 +
+ xbmc/guilib/GUIFontTTF.cpp                    |   9 +-
+ xbmc/guilib/GUIFontTTF.h                      |   2 +
+ xbmc/guilib/GUIFontTTFGLES.cpp                |  31 +-
+ xbmc/guilib/GUITextLayout.cpp                 |  33 +-
+ xbmc/guilib/Shader.cpp                        | 121 +++++-
+ xbmc/platform/ps4/PS4ShaderBin.cpp            | 148 ++++++++
+ xbmc/platform/ps4/PS4ShaderBin.h              |  45 +++
+ xbmc/rendering/GLExtensions.cpp               |  35 +-
+ xbmc/rendering/gles/GLESShader.cpp            |  25 +-
+ .../rendering/gles/GuiCompositeShaderGLES.cpp |   8 +
+ xbmc/rendering/gles/RenderSystemGLES.cpp      |  10 +
+ xbmc/windowing/ps4/CMakeLists.txt             |   5 +
+ xbmc/windowing/ps4/VideoSyncPs4.cpp           |  85 +++++
+ xbmc/windowing/ps4/VideoSyncPs4.h             |  33 ++
+ xbmc/windowing/ps4/WinSystemPs4GLES.cpp       | 358 ++++++++++++++++++
+ xbmc/windowing/ps4/WinSystemPs4GLES.h         |  72 ++++
+ 30 files changed, 1321 insertions(+), 79 deletions(-)
+ create mode 100644 system/shaders/GLES/2.0/gles_pack.frag
+ create mode 100644 xbmc/platform/ps4/PS4ShaderBin.cpp
+ create mode 100644 xbmc/platform/ps4/PS4ShaderBin.h
+ create mode 100644 xbmc/windowing/ps4/CMakeLists.txt
+ create mode 100644 xbmc/windowing/ps4/VideoSyncPs4.cpp
+ create mode 100644 xbmc/windowing/ps4/VideoSyncPs4.h
+ create mode 100644 xbmc/windowing/ps4/WinSystemPs4GLES.cpp
+ create mode 100644 xbmc/windowing/ps4/WinSystemPs4GLES.h
+
+diff --git a/system/shaders/GLES/2.0/gles_pack.frag b/system/shaders/GLES/2.0/gles_pack.frag
+new file mode 100644
+index 0000000000..45f776ced9
+--- /dev/null
++++ b/system/shaders/GLES/2.0/gles_pack.frag
+@@ -0,0 +1,16 @@
++#version 100
++
++precision mediump float;
++
++uniform sampler2D img;
++uniform vec4 m_packmask;
++varying vec2 cord;
++
++void main()
++{
++  vec4 t = texture2D(img, cord);
++  /* mask selects the channels; V goes to B so we do not depend on the
++   * (non per-channel) GNM render-target mask. */
++  gl_FragColor = vec4(t.r * m_packmask.r, t.g * m_packmask.g,
++                      t.a * m_packmask.b, 0.0);
++}
+diff --git a/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag b/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
+index 7893e305ef..cbdc6d2ca9 100644
+--- a/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
++++ b/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
+@@ -24,7 +24,9 @@ precision mediump float;
+ 
+ uniform sampler2D m_sampY;
+ uniform sampler2D m_sampU;
++#if !defined(XBMC_NV12) && !defined(XBMC_PS4_PACKED)
+ uniform sampler2D m_sampV;
++#endif
+ varying vec2 m_cordY;
+ varying vec2 m_cordU;
+ varying vec2 m_cordV;
+@@ -43,18 +45,37 @@ void main()
+   vec4 rgb;
+   vec4 yuv;
+ 
+-#if defined(XBMC_YV12) || defined(XBMC_NV12)
++#if defined(XBMC_YV12)
+ 
++  /* YV12 chroma planes are half-size but share the same normalized texture
++   * space as luma.  Sampling them with m_cordY keeps chroma aligned with
++   * luma; the separate m_cordU/m_cordV varyings were producing a constant
++   * (green/white) chroma sample on PS4. */
+   yuv = vec4(texture2D(m_sampY, m_cordY).r,
+-             texture2D(m_sampU, m_cordU).g,
+-             texture2D(m_sampV, m_cordV).a,
++             texture2D(m_sampU, m_cordY).r,
++             texture2D(m_sampV, m_cordY).r,
+              1.0);
+ 
++#elif defined(XBMC_PS4_PACKED)
++
++  /* PS4 GPU-packed path: one RGBA texture, R=Y, G=U, A=V. */
++  {
++    vec4 packed = texture2D(m_sampY, m_cordY);
++    yuv = vec4(packed.r, packed.g, packed.b, 1.0);
++  }
++
++#elif defined(XBMC_NV12)
++
++  /* PS4: a single interleaved UV texture.  m_sampV is not used, so the
++   * shader only needs two samplers (the layout proven by the GUI). */
++  vec4 uv = texture2D(m_sampU, m_cordU);
++  yuv = vec4(texture2D(m_sampY, m_cordY).r, uv.g, uv.a, 1.0);
++
+ #elif defined(XBMC_YV12_HI)
+ 
+   yuv = vec4(texture2D(m_sampY, m_cordY).r,
+-             texture2D(m_sampU, m_cordU).r,
+-             texture2D(m_sampV, m_cordV).r,
++             texture2D(m_sampU, m_cordY).r,
++             texture2D(m_sampV, m_cordY).r,
+              1.0);
+ 
+ #elif defined(XBMC_NV12_RRG)
+diff --git a/system/shaders/GLES/2.0/gles_yuv2rgb_bob.frag b/system/shaders/GLES/2.0/gles_yuv2rgb_bob.frag
+index 0c7811a175..222e55b75a 100644
+--- a/system/shaders/GLES/2.0/gles_yuv2rgb_bob.frag
++++ b/system/shaders/GLES/2.0/gles_yuv2rgb_bob.frag
+@@ -21,9 +21,28 @@
+ #version 100
+ 
+ precision highp float;
++
++/* YV12 keeps Y/U/V in three one-byte planes, so chroma is in .r.  NV12
++ * uses one interleaved UV texture, so both U and V come from m_sampU
++ * (the shader then only needs two samplers). */
++#if defined(XBMC_YV12) || defined(XBMC_YV12_HI)
++#define YUV_U(coord) texture2D(m_sampU, coord).r
++#define YUV_V(coord) texture2D(m_sampV, coord).r
++#elif defined(XBMC_NV12)
++#define YUV_U(coord) texture2D(m_sampU, coord).g
++#define YUV_V(coord) texture2D(m_sampU, coord).a
++#elif defined(XBMC_PS4_PACKED)
++#define YUV_U(coord) texture2D(m_sampY, coord).g
++#define YUV_V(coord) texture2D(m_sampY, coord).b
++#else
++#define YUV_U(coord) texture2D(m_sampU, coord).g
++#define YUV_V(coord) texture2D(m_sampV, coord).a
++#endif
+ uniform sampler2D m_sampY;
+ uniform sampler2D m_sampU;
++#if !defined(XBMC_NV12) && !defined(XBMC_PS4_PACKED)
+ uniform sampler2D m_sampV;
++#endif
+ varying vec2 m_cordY;
+ varying vec2 m_cordU;
+ varying vec2 m_cordV;
+@@ -73,11 +92,11 @@ void main()
+   vec4 yuvAbove;
+   vec4 yuvBelow;
+ 
+-  yuvAbove = vec4(texture2D(m_sampY, offsetY).r, texture2D(m_sampU, offsetU).g, texture2D(m_sampV, offsetV).a, 1.0);
++  yuvAbove = vec4(texture2D(m_sampY, offsetY).r, YUV_U(offsetU), YUV_V(offsetV), 1.0);
+   rgbAbove = m_yuvmat * yuvAbove;
+   rgbAbove.a = m_alpha;
+ 
+-  yuvBelow = vec4(texture2D(m_sampY, belowY).r, texture2D(m_sampU, belowU).g, texture2D(m_sampV, belowV).a, 1.0);
++  yuvBelow = vec4(texture2D(m_sampY, belowY).r, YUV_U(belowU), YUV_V(belowV), 1.0);
+   rgbBelow = m_yuvmat * yuvBelow;
+   rgbBelow.a = m_alpha;
+ 
+diff --git a/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp b/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
+index 78f58c323b..4b39ffc431 100644
+--- a/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
++++ b/xbmc/cores/VideoPlayer/Process/ProcessInfo.cpp
+@@ -610,6 +610,11 @@ std::vector<AVPixelFormat> CProcessInfo::GetRenderFormats()
+ {
+   std::vector<AVPixelFormat> formats;
+   formats.push_back(AV_PIX_FMT_YUV420P);
++  // The GLES renderer samples full-range YV12 directly (the YUV2RGB matrix
++  // applies the range), so keep the decoder from inserting a swscale filter
++  // for JPEG-range H.264.  The filter path was failing with
++  // av_buffersink_get_frame and leaving a black canvas.
++  formats.push_back(AV_PIX_FMT_YUVJ420P);
+   return formats;
+ }
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 100ea0d4cf..b97abba3e3 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -4588,7 +4588,11 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+                                                    (hint.fpsrate * (hint.interlaced ? 2 : 1)));
+ 
+       RESOLUTION res = CResolutionUtils::ChooseBestResolution(static_cast<float>(framerate), hint.width, hint.height, !hint.stereo_mode.empty());
+-      CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
++      // Changing resolution from this player thread uses a blocking app
++      // message.  The PS4 window system has a fixed 1080p mode, so skip the
++      // call when the resolution is already active.
++      if (res != CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution())
++        CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
+       m_renderManager.TriggerUpdateResolution(framerate, hint.width, hint.height, hint.stereo_mode);
+     }
+   }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+index 604999e42e..0b3b63717e 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+@@ -360,7 +360,11 @@ EShaderFormat CBaseRenderer::GetShaderFormat()
+ 
+   // clang-format off
+   if (m_format == AV_PIX_FMT_YUV420P ||
+-      m_format == AV_PIX_FMT_YUV422P ||
++      m_format == AV_PIX_FMT_YUVJ420P)
++    // PS4: the GPU packs Y/U/V into one RGBA texture and the final
++    // shader uses a single sampler (multi-sampler SRT is broken).
++    ret = SHADER_PS4_PACKED;
++  else if (m_format == AV_PIX_FMT_YUV422P ||
+       m_format == AV_PIX_FMT_YUV444P)
+     ret = SHADER_YV12;
+   else if (m_format == AV_PIX_FMT_YUV420P9 ||
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index 2b9efdb720..1d4896b26a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -41,6 +41,7 @@ if(TARGET ${APP_NAME_LC}::OpenGLES AND ("android" IN_LIST CORE_PLATFORM_NAME_LC
+                             "ios" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "tvos" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "gbm" IN_LIST CORE_PLATFORM_NAME_LC OR
++                            "ps4" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "x11" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "wayland" IN_LIST CORE_PLATFORM_NAME_LC))
+   list(APPEND SOURCES LinuxRendererGLES.cpp
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 2762bc361d..6c6db4dd73 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -35,6 +35,42 @@
+ using namespace Shaders;
+ using namespace Shaders::GLES;
+ 
++namespace
++{
++/* One-sampler pack shader: adds its contribution to the packed FBO with
++ * additive blending, so the GNM render-target mask (which is not a
++ * per-channel write mask) is not needed. */
++class CPackShader : public DefaultFilterShader
++{
++public:
++  CPackShader() { PixelShader()->LoadSource("gles_pack.frag"); }
++
++  void OnCompiledAndLinked() override
++  {
++    DefaultFilterShader::OnCompiledAndLinked();
++    m_hMask = glGetUniformLocation(ProgramHandle(), "m_packmask");
++  }
++
++  bool OnEnabled() override
++  {
++    DefaultFilterShader::OnEnabled();
++    glUniform4f(m_hMask, m_mask[0], m_mask[1], m_mask[2], 0.0f);
++    return true;
++  }
++
++  void SetMask(float r, float g, float b)
++  {
++    m_mask[0] = r;
++    m_mask[1] = g;
++    m_mask[2] = b;
++  }
++
++private:
++  GLint m_hMask{-1};
++  float m_mask[3]{1.0f, 0.0f, 0.0f};
++};
++} // namespace
++
+ CLinuxRendererGLES::CLinuxRendererGLES()
+ {
+   m_format = AV_PIX_FMT_NONE;
+@@ -1083,6 +1119,14 @@ void CLinuxRendererGLES::UnInit()
+ 
+   // cleanup framebuffer object if it was in use
+   m_fbo.fbo.Cleanup();
++  if (m_packShader)
++  {
++    delete m_packShader;
++    m_packShader = nullptr;
++  }
++  m_packedFbo.Cleanup();
++  m_packedValid = false;
++  m_packedWidth = m_packedHeight = 0;
+   m_bValidated = false;
+   m_bConfigured = false;
+ }
+@@ -1178,6 +1222,8 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+   else if (m_renderMethod & RENDER_GLSL)
+   {
+     UpdateVideoFilter();
++    if (m_format == AV_PIX_FMT_YUV420P || m_format == AV_PIX_FMT_YUVJ420P)
++      PackVideoToRGBA(index);
+     switch(m_renderQuality)
+     {
+     case RQ_LOW:
+@@ -1207,6 +1253,111 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+   return true;
+ }
+ 
++void CLinuxRendererGLES::PackVideoToRGBA(int index)
++{
++  if (!m_packShader)
++  {
++    m_packShader = new CPackShader();
++    if (!m_packShader->CompileAndLink())
++    {
++      CLog::Log(LOGERROR, "GLES: PS4 pack shader failed to compile");
++      delete m_packShader;
++      m_packShader = nullptr;
++      return;
++    }
++  }
++
++  if (!m_packedValid || m_packedWidth != (int)m_sourceWidth ||
++      m_packedHeight != (int)m_sourceHeight)
++  {
++    m_packedFbo.Cleanup();
++    if (!m_packedFbo.Initialize() ||
++        !m_packedFbo.CreateAndBindToTexture(GL_TEXTURE_2D, m_sourceWidth, m_sourceHeight,
++                                            GL_RGBA))
++    {
++      CLog::Log(LOGERROR, "GLES: PS4 packed FBO creation failed");
++      m_packedValid = false;
++      return;
++    }
++    m_packedWidth = m_sourceWidth;
++    m_packedHeight = m_sourceHeight;
++    m_packedValid = true;
++  }
++
++  CPictureBuffer& buf = m_buffers[index];
++  CYuvPlane (&planes)[YuvImage::MAX_PLANES] = buf.fields[FIELD_FULL];
++  if (!planes[0].id || !planes[1].id || !planes[2].id)
++    return;
++
++  if (!m_packedFbo.BeginRender())
++    return;
++
++  CRect savedViewport;
++  m_renderSystem->GetViewPort(savedViewport);
++  glViewport(0, 0, m_sourceWidth, m_sourceHeight);
++  glDisable(GL_DEPTH_TEST);
++  glDisable(GL_CULL_FACE);
++  glDisable(GL_SCISSOR_TEST);
++  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++  glClear(GL_COLOR_BUFFER_BIT);
++
++  // Match the texture upload orientation: source row 0 is the top row, so
++  // the pack pass must map y=0 to NDC +1.  The previous projection mapped
++  // y=0 to -1 and the final video came out vertically flipped.
++  const GLfloat proj[16] = {2.0f / m_sourceWidth, 0, 0, 0,
++                            0, -2.0f / m_sourceHeight, 0, 0,
++                            0, 0, -1.0f, 0,
++                            -1.0f, 1.0f, 0, 1.0f};
++  const GLfloat model[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++
++  m_packShader->SetSourceTexture(0);
++  m_packShader->SetAlpha(1.0f);
++  m_packShader->SetMatrices(proj, model);
++
++  GLint vertLoc = m_packShader->GetVertexLoc();
++  GLint loc = m_packShader->GetcoordLoc();
++
++  const GLfloat quadVerts[8] = {0.0f, 0.0f,
++                                static_cast<GLfloat>(m_sourceWidth), 0.0f,
++                                0.0f, static_cast<GLfloat>(m_sourceHeight),
++                                static_cast<GLfloat>(m_sourceWidth),
++                                static_cast<GLfloat>(m_sourceHeight)};
++  const GLfloat quadCoords[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
++
++  glBindBuffer(GL_ARRAY_BUFFER, 0);
++  glVertexAttribPointer(vertLoc, 2, GL_FLOAT, 0, 0, quadVerts);
++  glVertexAttribPointer(loc, 2, GL_FLOAT, 0, 0, quadCoords);
++  glEnableVertexAttribArray(vertLoc);
++  glEnableVertexAttribArray(loc);
++
++  // Additive blending avoids the GNM render-target mask (which is not a
++  // per-channel write mask).  Pass 0 writes R=Y; pass 1 writes G=U, B=V.
++  glEnable(GL_BLEND);
++  glBlendFunc(GL_ONE, GL_ONE);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++
++  const GLuint packTex[2] = {planes[0].id, planes[1].id};
++  const float packMask[2][3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 1.0f}};
++  for (int p = 0; p < 2; ++p)
++  {
++    static_cast<CPackShader*>(m_packShader)
++        ->SetMask(packMask[p][0], packMask[p][1], packMask[p][2]);
++    m_packShader->Enable();
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(m_textureTarget, packTex[p]);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    m_packShader->Disable();
++  }
++
++  glDisable(GL_BLEND);
++  glDisableVertexAttribArray(loc);
++  glDisableVertexAttribArray(vertLoc);
++  glBindBuffer(GL_ARRAY_BUFFER, 0);
++  glBindTexture(m_textureTarget, 0);
++  m_packedFbo.EndRender();
++  m_renderSystem->SetViewPort(savedViewport);
++}
++
+ void CLinuxRendererGLES::RenderSinglePass(int index, int field)
+ {
+   CPictureBuffer &buf = m_buffers[index];
+@@ -1220,19 +1371,34 @@ void CLinuxRendererGLES::RenderSinglePass(int index, int field)
+     LoadShaders(field);
+   }
+ 
+-  // Y
+-  glActiveTexture(GL_TEXTURE0);
+-  glBindTexture(m_textureTarget, planes[0].id);
++  if ((m_format == AV_PIX_FMT_YUV420P || m_format == AV_PIX_FMT_YUVJ420P) && m_packedValid)
++  {
++    // PS4 packed path: one RGBA texture (R=Y, G=U, B=V).
++    const GLuint packed = m_packedFbo.Texture();
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(m_textureTarget, packed);
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(m_textureTarget, packed);
++    glActiveTexture(GL_TEXTURE2);
++    glBindTexture(m_textureTarget, packed);
++    glActiveTexture(GL_TEXTURE0);
++  }
++  else
++  {
++    // Y
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(m_textureTarget, planes[0].id);
+ 
+-  // U
+-  glActiveTexture(GL_TEXTURE1);
+-  glBindTexture(m_textureTarget, planes[1].id);
++    // U
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(m_textureTarget, planes[1].id);
+ 
+-  // V
+-  glActiveTexture(GL_TEXTURE2);
+-  glBindTexture(m_textureTarget, planes[2].id);
++    // V
++    glActiveTexture(GL_TEXTURE2);
++    glBindTexture(m_textureTarget, planes[2].id);
+ 
+-  glActiveTexture(GL_TEXTURE0);
++    glActiveTexture(GL_TEXTURE0);
++  }
+   VerifyGLState();
+ 
+   Shaders::GLES::BaseYUV2RGBGLSLShader* pYUVShader;
+@@ -1604,15 +1770,42 @@ bool CLinuxRendererGLES::UploadPlanarYUVTexture(int source)
+   }
+   else
+   {
+-    // 8-bit: GL_LUMINANCE for Y/U, GL_ALPHA for V
++    const unsigned cw = im->width >> im->cshift_x;
++    const unsigned ch = im->height >> im->cshift_y;
++    const size_t need = (size_t)cw * (size_t)ch * 2;
++    if (m_uvInterleave.size() < need)
++      m_uvInterleave.resize(need);
++
++    // Y plane (R8).
+     LoadPlane(buf.fields[FIELD_FULL][0], GL_LUMINANCE, im->width, im->height, im->stride[0],
+               im->bpp, im->plane[0]);
+ 
+-    LoadPlane(buf.fields[FIELD_FULL][1], GL_LUMINANCE, im->width >> im->cshift_x,
+-              im->height >> im->cshift_y, im->stride[1], im->bpp, im->plane[1]);
+-
+-    LoadPlane(buf.fields[FIELD_FULL][2], GL_ALPHA, im->width >> im->cshift_x,
+-              im->height >> im->cshift_y, im->stride[2], im->bpp, im->plane[2]);
++    if (im->plane[1] && im->plane[2] && cw && ch && m_uvInterleave.size() >= need)
++    {
++      // PS4 NV12: interleave U/V into one GL_LUMINANCE_ALPHA texture.
++      // The shader reads U from .g and V from .a with two samplers.
++      for (unsigned y = 0; y < ch; ++y)
++      {
++        const unsigned char* u = im->plane[1] + (size_t)y * im->stride[1];
++        const unsigned char* v = im->plane[2] + (size_t)y * im->stride[2];
++        unsigned char* dst = m_uvInterleave.data() + (size_t)y * cw * 2;
++        for (unsigned x = 0; x < cw; ++x)
++        {
++          dst[2 * x] = u[x];
++          dst[2 * x + 1] = v[x];
++        }
++      }
++      LoadPlane(buf.fields[FIELD_FULL][1], GL_LUMINANCE_ALPHA, cw, ch, (int)cw * 2, 1,
++                m_uvInterleave.data());
++    }
++    else
++    {
++      // Fallback: old planar path (only safe with a YV12 shader).
++      LoadPlane(buf.fields[FIELD_FULL][1], GL_LUMINANCE, cw, ch, im->stride[1],
++                im->bpp, im->plane[1]);
++      LoadPlane(buf.fields[FIELD_FULL][2], GL_LUMINANCE, cw, ch, im->stride[2],
++                im->bpp, im->plane[2]);
++    }
+   }
+ 
+   VerifyGLState();
+@@ -1636,6 +1829,13 @@ void CLinuxRendererGLES::DeletePlanarYUVTexture(int index)
+   {
+     for(int p = 0; p < YuvImage::MAX_PLANES; p++)
+     {
++      if (p == 2 && im.bpp == 1 &&
++          m_buffers[index].fields[f][2].id == m_buffers[index].fields[f][1].id)
++      {
++        // NV12 path: V shares the interleaved UV texture.
++        m_buffers[index].fields[f][p].id = 0;
++        continue;
++      }
+       if (m_buffers[index].fields[f][p].id)
+       {
+         if (glIsTexture(m_buffers[index].fields[f][p].id))
+@@ -1692,6 +1892,12 @@ bool CLinuxRendererGLES::CreatePlanarYUVTexture(int index)
+   {
+     for(p = 0; p < YuvImage::MAX_PLANES; p++)
+     {
++      if (im.bpp == 1 && p == 2)
++      {
++        // NV12 path: V is the same interleaved UV texture as U.
++        m_buffers[index].fields[f][2].id = m_buffers[index].fields[f][1].id;
++        continue;
++      }
+       if (!glIsTexture(m_buffers[index].fields[f][p].id))
+       {
+         glGenTextures(1, &m_buffers[index].fields[f][p].id);
+@@ -1722,6 +1928,11 @@ bool CLinuxRendererGLES::CreatePlanarYUVTexture(int index)
+ 
+     for(int p = 0; p < 3; p++)
+     {
++      if (im.bpp == 1 && p == 2)
++      {
++        // NV12 path: V shares the U (interleaved UV) texture.
++        continue;
++      }
+       CYuvPlane &plane = planes[p];
+       if (plane.texwidth * plane.texheight == 0)
+       {
+@@ -1742,12 +1953,7 @@ bool CLinuxRendererGLES::CreatePlanarYUVTexture(int index)
+       }
+       else
+       {
+-        GLint format;
+-        if (p == 2) // V plane needs an alpha texture
+-          format = GL_ALPHA;
+-        else
+-          format = GL_LUMINANCE;
+-
++        const GLint format = (p == 1) ? GL_LUMINANCE_ALPHA : GL_LUMINANCE;
+         glTexImage2D(m_textureTarget, 0, format, plane.texwidth, plane.texheight, 0, format,
+                      GL_UNSIGNED_BYTE, nullptr);
+       }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index f719b5a69c..7a66f508cf 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -35,6 +35,7 @@ namespace GLES
+ {
+ class BaseYUV2RGBGLSLShader;
+ class BaseVideoFilterShader;
++class DefaultFilterShader;
+ }
+ } // namespace Shaders
+ 
+@@ -224,6 +225,17 @@ protected:
+   // TODO: GL has m_intermediateGammaCorrection -- add when ported to GLES
+   unsigned char* m_planeBuffer = nullptr;
+   size_t m_planeBufferSize = 0;
++  /* Interleaved UV scratch for the PS4 NV12 path (YUV420P source). */
++  std::vector<unsigned char> m_uvInterleave;
++
++  /* PS4 GPU-packed path: Y/U/V are packed into one RGBA texture by
++   * three one-sampler passes, then the final YUV shader samples it. */
++  CFrameBufferObject m_packedFbo;
++  Shaders::GLES::DefaultFilterShader* m_packShader{nullptr};
++  bool m_packedValid{false};
++  int m_packedWidth{0};
++  int m_packedHeight{0};
++  void PackVideoToRGBA(int index);
+ 
+   CRect m_lastViewRect;
+   CRect m_lastSourceRect;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
+index 4cf1269214..12d653809d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
+@@ -34,6 +34,7 @@ if(TARGET ${APP_NAME_LC}::OpenGLES AND ("android" IN_LIST CORE_PLATFORM_NAME_LC
+                             "ios" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "tvos" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "gbm" IN_LIST CORE_PLATFORM_NAME_LC OR
++                            "ps4" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "x11" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "wayland" IN_LIST CORE_PLATFORM_NAME_LC))
+   list(APPEND SOURCES VideoFilterShaderGLES.cpp
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/ShaderFormats.h b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/ShaderFormats.h
+index f98cba62fb..8a5fe99a8b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/ShaderFormats.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/ShaderFormats.h
+@@ -30,6 +30,7 @@ enum EShaderFormat
+   SHADER_Y410, // packed 4:4:4 in GL_RGB10_A2 (Y410)
+   SHADER_Y412, // packed 4:4:4 in GL_RGBA16 (Y412 / Y416)
+   SHADER_RGB, // already RGB, no conversion
++  SHADER_PS4_PACKED, // PS4: one RGBA texture, R=Y G=U B=V
+   SHADER_MAX,
+ };
+ 
+@@ -70,6 +71,7 @@ private:
+       {SHADER_Y410, "Y410 packed 4:4:4 10-bit"},
+       {SHADER_Y412, "Y412 packed 4:4:4 12/16-bit"},
+       {SHADER_RGB, "RGB"},
++      {SHADER_PS4_PACKED, "PS4 packed YUV"},
+   });
+ 
+   static_assert(SHADER_MAX == shaderFormatMap.size(),
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+index 52e1ac8dba..1e62064726 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+@@ -64,6 +64,8 @@ BaseYUV2RGBGLSLShader::BaseYUV2RGBGLSLShader(EShaderFormat format,
+     m_defines += "#define XBMC_Y410\n";
+   else if (m_format == SHADER_Y412)
+     m_defines += "#define XBMC_Y412\n";
++  else if (m_format == SHADER_PS4_PACKED)
++    m_defines += "#define XBMC_PS4_PACKED\n";
+   else
+     CLog::Log(LOGERROR, "GLES: BaseYUV2RGBGLSLShader - unsupported format {}",
+               fmt::formatter<EShaderFormat>::ToString(m_format));
+diff --git a/xbmc/guilib/GUIEditControl.cpp b/xbmc/guilib/GUIEditControl.cpp
+index 99c1fb87cc..3f399b0b28 100644
+--- a/xbmc/guilib/GUIEditControl.cpp
++++ b/xbmc/guilib/GUIEditControl.cpp
+@@ -77,6 +77,11 @@ CGUIEditControl::CGUIEditControl(int parentID, int controlID, float posX, float
+ 
+ void CGUIEditControl::DefaultConstructor()
+ {
++#if defined(__ORBIS__)
++  // Avoid the small-string to heap transition, which corrupts the buffer
++  // on PS4.
++  m_text2.reserve(256);
++#endif
+   ControlType = GUICONTROL_EDIT;
+   m_textOffset = 0;
+   m_cursorPos = 0;
+@@ -526,7 +531,21 @@ void CGUIEditControl::ProcessText(unsigned int currentTime)
+ 
+     changed |= m_label2.SetMaxRect(m_clipRect.x1 + m_textOffset, m_posY, m_clipRect.Width() - m_textOffset, m_height);
+ 
++#if defined(__ORBIS__)
++    // Avoid copying m_text2; the wstring copy allocates a buffer that is
++    // corrupted on PS4.
++    const std::wstring* textPtr = &m_text2;
++    std::wstring textStorage;
++    if (m_inputType == INPUT_TYPE_PASSWORD || m_inputType == INPUT_TYPE_PASSWORD_MD5 ||
++        m_inputType == INPUT_TYPE_PASSWORD_NUMBER_VERIFY_NEW || !m_edit.empty())
++    {
++      textStorage = GetDisplayedText();
++      textPtr = &textStorage;
++    }
++    const std::wstring& text = *textPtr;
++#else
+     std::wstring text = GetDisplayedText();
++#endif
+     std::string hint = m_hintInfo.GetLabel(GetParentID());
+ 
+     if (!HasFocus() && text.empty() && !hint.empty())
+@@ -673,6 +692,10 @@ void CGUIEditControl::SetLabel2(const std::string &text)
+   {
+     m_isMD5 = (m_inputType == INPUT_TYPE_PASSWORD_MD5 || m_inputType == INPUT_TYPE_PASSWORD_NUMBER_VERIFY_NEW);
+     m_text2 = newText;
++#if defined(__ORBIS__)
++    if (m_text2.capacity() < 256)
++      m_text2.reserve(256);
++#endif
+     m_cursorPos = m_text2.size();
+     ValidateInput();
+     SetInvalid();
+diff --git a/xbmc/guilib/GUIEditControl.h b/xbmc/guilib/GUIEditControl.h
+index 2fafd2856a..8b096c050b 100644
+--- a/xbmc/guilib/GUIEditControl.h
++++ b/xbmc/guilib/GUIEditControl.h
+@@ -18,6 +18,8 @@
+ #include "utils/StringValidation.h"
+ #include "utils/Variant.h"
+ 
++#include <cstdint>
++
+ /*!
+  \ingroup controls
+  \brief
+diff --git a/xbmc/guilib/GUIFontTTF.cpp b/xbmc/guilib/GUIFontTTF.cpp
+index 2c25618d2f..493e96a5be 100644
+--- a/xbmc/guilib/GUIFontTTF.cpp
++++ b/xbmc/guilib/GUIFontTTF.cpp
+@@ -405,7 +405,10 @@ void CGUIFontTTF::DrawTextInternal(CGraphicContext& context,
+           ? m_dynamicCache.Lookup(context, dynamicPos, colors, text, alignment, maxPixelWidth,
+                                   hScrolling, std::chrono::steady_clock::now(), dirtyCache)
+           : unusedVertexBuffer;
+-  std::shared_ptr<std::vector<SVertex>> tempVertices = std::make_shared<std::vector<SVertex>>();
++  if (!m_tempVertices)
++    m_tempVertices = std::make_shared<std::vector<SVertex>>();
++  std::shared_ptr<std::vector<SVertex>>& tempVertices = m_tempVertices;
++  tempVertices->clear();
+   std::shared_ptr<std::vector<SVertex>>& vertices =
+       hardwareClipping ? tempVertices
+                        : static_cast<std::shared_ptr<std::vector<SVertex>>&>(m_staticCache.Lookup(
+@@ -958,6 +961,10 @@ CGUIFontTTF::Character* CGUIFontTTF::GetCharacter(character_t chr, FT_UInt glyph
+   {
+     m_char.reserve(m_char.capacity() + CHAR_CHUNK);
+     startIndex = 0;
++    // The quick lookup table holds pointers into m_char.  reserve() moves the
++    // storage, so every existing entry is now dangling.  Clear it before
++    // CacheCharacter()/End() can render text and dereference those pointers.
++    memset(m_charquick, 0, sizeof(m_charquick));
+   }
+ 
+   // render the character to our texture
+diff --git a/xbmc/guilib/GUIFontTTF.h b/xbmc/guilib/GUIFontTTF.h
+index b7ef8c627b..deac790fc5 100644
+--- a/xbmc/guilib/GUIFontTTF.h
++++ b/xbmc/guilib/GUIFontTTF.h
+@@ -267,6 +267,8 @@ protected:
+   };
+   std::vector<CTranslatedVertices> m_vertexTrans;
+   std::vector<SVertex> m_vertex;
++  /* Reused by DrawTextInternal to avoid a make_shared per frame. */
++  std::shared_ptr<std::vector<SVertex>> m_tempVertices;
+ 
+   float m_textureScaleX{0.0f};
+   float m_textureScaleY{0.0f};
+diff --git a/xbmc/guilib/GUIFontTTFGLES.cpp b/xbmc/guilib/GUIFontTTFGLES.cpp
+index 6554740fc6..c61b70e1bb 100644
+--- a/xbmc/guilib/GUIFontTTFGLES.cpp
++++ b/xbmc/guilib/GUIFontTTFGLES.cpp
+@@ -24,6 +24,7 @@
+ #include "windowing/GraphicContext.h"
+ #include "windowing/WinSystem.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <memory>
+ 
+@@ -356,8 +357,26 @@ std::unique_ptr<CTexture> CGUIFontTTFGLES::ReallocTexture(unsigned int& newHeigh
+   if (m_textureHeight < newHeight)
+     CLog::LogF(LOGWARNING, "allocated new texture with height of {}, requested {}", m_textureHeight,
+                newHeight);
++#if defined(__ORBIS__)
++  // The atlas normally only grows in height and the glyphs keep their
++  // positions (the copy below preserves them).  Cached vertex buffers
++  // therefore stay valid.  Flushing here destroys CVertexBuffer objects that
++  // m_vertexTrans still points to while the current frame is being built;
++  // their memory is reused by the next text and the GPU draws glyphs from
++  // another label (.notdef boxes, changed characters).  Keep both caches on
++  // PS4 unless the atlas actually shrinks or changes width.
++  const bool keepCaches =
++      !m_texture || (newTexture->GetWidth() == m_texture->GetWidth() &&
++                     newTexture->GetHeight() >= m_texture->GetHeight());
++  if (!keepCaches)
++  {
++    m_staticCache.Flush();
++    m_dynamicCache.Flush();
++  }
++#else
+   m_staticCache.Flush();
+   m_dynamicCache.Flush();
++#endif
+ 
+   memset(newTexture->GetPixels(), 0, m_textureHeight * newTexture->GetPitch());
+   if (m_texture)
+@@ -365,11 +384,16 @@ std::unique_ptr<CTexture> CGUIFontTTFGLES::ReallocTexture(unsigned int& newHeigh
+     m_updateY1 = 0;
+     m_updateY2 = m_texture->GetHeight();
+ 
++    // The new texture can be smaller than the old one (font size/style
++    // change); never copy more rows or bytes than the destination holds.
++    const unsigned int copyHeight =
++        std::min(m_texture->GetHeight(), newTexture->GetHeight());
++    const size_t copyPitch = std::min(m_texture->GetPitch(), newTexture->GetPitch());
+     unsigned char* src = m_texture->GetPixels();
+     unsigned char* dst = newTexture->GetPixels();
+-    for (unsigned int y = 0; y < m_texture->GetHeight(); y++)
++    for (unsigned int y = 0; y < copyHeight; y++)
+     {
+-      memcpy(dst, src, m_texture->GetPitch());
++      memcpy(dst, src, copyPitch);
+       src += m_texture->GetPitch();
+       dst += newTexture->GetPitch();
+     }
+@@ -383,6 +407,9 @@ std::unique_ptr<CTexture> CGUIFontTTFGLES::ReallocTexture(unsigned int& newHeigh
+ bool CGUIFontTTFGLES::CopyCharToTexture(
+     FT_BitmapGlyph bitGlyph, unsigned int x1, unsigned int y1, unsigned int x2, unsigned int y2)
+ {
++  if (x2 <= x1 || y2 <= y1)
++    return false;
++
+   FT_Bitmap bitmap = bitGlyph->bitmap;
+ 
+   unsigned char* source = bitmap.buffer;
+diff --git a/xbmc/guilib/GUITextLayout.cpp b/xbmc/guilib/GUITextLayout.cpp
+index 409e77ed56..48dc120083 100644
+--- a/xbmc/guilib/GUITextLayout.cpp
++++ b/xbmc/guilib/GUITextLayout.cpp
+@@ -239,6 +239,12 @@ bool CGUITextLayout::Update(const std::string &text, float maxWidth, bool forceU
+   m_lastUtf8Text = text;
+   m_lastUpdateW = false;
+   std::wstring utf16;
++#if defined(__ORBIS__)
++  // Avoid a fresh wstring allocation/copy for every label.  On PS4 the
++  // allocation path for long wstrings is corrupting the new buffer; writing
++  // into an already-reserved buffer is reliable.
++  utf16.reserve(text.size() + 1);
++#endif
+   g_charsetConverter.utf8ToW(text, utf16, false);
+   UpdateCommon(utf16, maxWidth, forceLTRReadingOrder);
+   return true;
+@@ -249,6 +255,10 @@ bool CGUITextLayout::UpdateW(const std::wstring &text, float maxWidth /*= 0*/, b
+   if (text == m_lastText && !forceUpdate && m_lastUpdateW)
+     return false;
+ 
++#if defined(__ORBIS__)
++  if (m_lastText.capacity() < text.size() + 1)
++    m_lastText.reserve(text.size() + 1);
++#endif
+   m_lastText = text;
+   m_lastUpdateW = true;
+   UpdateCommon(text, maxWidth, forceLTRReadingOrder);
+@@ -354,6 +364,9 @@ std::wstring CGUITextLayout::BidiFlip(const std::wstring& text,
+   g_charsetConverter.utf32logicalToVisualBiDi(utf32logical, utf32visual, forceLTRReadingOrder,
+                                               false,
+                                               visualToLogicalMap);
++#if defined(__ORBIS__)
++  visualText.reserve(utf32visual.size() + 1);
++#endif
+   g_charsetConverter.utf32ToW(utf32visual, visualText);
+ 
+   return visualText;
+@@ -652,13 +665,13 @@ void CGUITextLayout::WrapText(const vecText &text, float maxWidth)
+     {
+       if (start == end)
+         return 0.0f;
+-      return m_font->GetTextWidth({start, end});
++      return m_font->GetTextWidth(std::span<const character_t>(&*start, static_cast<std::size_t>(end - start)));
+     };
+ 
+     auto skipLeadingSpaces = [&](vecText::const_iterator& it)
+     {
+       it = std::find_if_not(it, line.m_text.end(),
+-                            std::bind_front(&CGUITextLayout::CanWrapAtLetter, this));
++                            [this](const auto& c) { return CanWrapAtLetter(c); });
+     };
+ 
+     auto current = line.m_text.begin();
+@@ -673,7 +686,7 @@ void CGUITextLayout::WrapText(const vecText &text, float maxWidth)
+     {
+       // Find next candidate wrap position
+       auto wordEnd = std::find_if(current, line.m_text.end(),
+-                                  std::bind_front(&CGUITextLayout::CanWrapAtLetter, this));
++                                  [this](const auto& c) { return CanWrapAtLetter(c); });
+       const bool hasSpace = (wordEnd != line.m_text.end());
+       const float wordWidth = widthOf(current, wordEnd);
+ 
+@@ -724,10 +737,16 @@ void CGUITextLayout::WrapText(const vecText &text, float maxWidth)
+       if (current == wordEnd)
+         break;
+ 
+-      // current line is empty and word is too long: split it after the last character that fits,
+-      // but take at least one to ensure progress
+-      const size_t bestCount =
+-          std::max<size_t>(m_font->GetFittingLength({current, wordEnd}, maxWidth), 1);
++      // current line is empty and word is too long: split by character using a safe linear scan.
++      // Do not assume monotonic width because shaping/kerning can make width shrink or grow non-linearly.
++      size_t bestCount = 0;
++      for (auto it = std::next(current); it < wordEnd; ++it)
++      {
++        if (m_font->GetTextWidth(std::span<const character_t>(&*current, static_cast<std::size_t>(it - current))) <= maxWidth)
++          bestCount = std::distance(current, it);
++      }
++      if (bestCount == 0)
++        bestCount = 1; // ensure progress even if a single glyph is wider than maxWidth
+ 
+       const auto cut = current + static_cast<ptrdiff_t>(bestCount);
+       m_lines.emplace_back(current, cut, false);
+diff --git a/xbmc/guilib/Shader.cpp b/xbmc/guilib/Shader.cpp
+index 33a522843e..5697614ed5 100644
+--- a/xbmc/guilib/Shader.cpp
++++ b/xbmc/guilib/Shader.cpp
+@@ -8,6 +8,14 @@
+ 
+ #include "Shader.h"
+ 
++#if defined(__ORBIS__)
++#include "platform/ps4/PS4ShaderBin.h"
++
++#include <GLES2/gl2.h>
++#include <cstdio>
++#include <string>
++#endif
++
+ #include "ServiceBroker.h"
+ #include "filesystem/File.h"
+ #include "rendering/RenderSystem.h"
+@@ -142,9 +150,22 @@ bool CGLSLVertexShader::Compile()
+   Free();
+ 
+   m_vertexShader = glCreateShader(GL_VERTEX_SHADER);
++#if defined(__ORBIS__)
++  unsigned int vertexHash = 0;
++  if (!PS4_LoadShaderBinary(m_vertexShader, m_source.c_str(),
++                            static_cast<unsigned int>(m_source.size()), GL_VERTEX_SHADER,
++                            &vertexHash))
++  {
++    CLog::Log(LOGERROR, "GL: no PS4 shader binary for vertex shader hash {:08x}", vertexHash);
++    const char *ptr = m_source.c_str();
++    glShaderSource(m_vertexShader, 1, &ptr, 0);
++    glCompileShader(m_vertexShader);
++  }
++#else
+   const char *ptr = m_source.c_str();
+   glShaderSource(m_vertexShader, 1, &ptr, 0);
+   glCompileShader(m_vertexShader);
++#endif
+   glGetShaderiv(m_vertexShader, GL_COMPILE_STATUS, params);
+   VerifyGLState();
+   if (params[0] != GL_TRUE)
+@@ -201,9 +222,22 @@ bool CGLSLPixelShader::Compile()
+   }
+ 
+   m_pixelShader = glCreateShader(GL_FRAGMENT_SHADER);
++#if defined(__ORBIS__)
++  unsigned int pixelHash = 0;
++  if (!PS4_LoadShaderBinary(m_pixelShader, m_source.c_str(),
++                            static_cast<unsigned int>(m_source.size()), GL_FRAGMENT_SHADER,
++                            &pixelHash))
++  {
++    CLog::Log(LOGERROR, "GL: no PS4 shader binary for pixel shader hash {:08x}", pixelHash);
++    const char *ptr = m_source.c_str();
++    glShaderSource(m_pixelShader, 1, &ptr, 0);
++    glCompileShader(m_pixelShader);
++  }
++#else
+   const char *ptr = m_source.c_str();
+   glShaderSource(m_pixelShader, 1, &ptr, 0);
+   glCompileShader(m_pixelShader);
++#endif
+   glGetShaderiv(m_pixelShader, GL_COMPILE_STATUS, params);
+   if (params[0] != GL_TRUE)
+   {
+@@ -304,34 +338,81 @@ bool CGLSLShaderProgram::CompileAndLink()
+     return false;
+   }
+ 
+-  // create program object
+-  if (!(m_shaderProgram = glCreateProgram()))
++  auto CreateAndLink = [&]() -> bool
+   {
+-    CLog::Log(LOGERROR, "GL: Error creating shader program handle");
+-    goto error;
+-  }
+-
+-  // attach the vertex shader
+-  glAttachShader(m_shaderProgram, m_pVP->Handle());
+-  VerifyGLState();
++    if (!(m_shaderProgram = glCreateProgram()))
++    {
++      CLog::Log(LOGERROR, "GL: Error creating shader program handle");
++      return false;
++    }
+ 
+-  // if we have a pixel shader, attach it. If not, fixed pipeline
+-  // will be used.
+-  if (m_pFP->Handle())
+-  {
+-    glAttachShader(m_shaderProgram, m_pFP->Handle());
++    // attach the vertex shader
++    glAttachShader(m_shaderProgram, m_pVP->Handle());
+     VerifyGLState();
+-  }
+ 
+-  // link the program
+-  glLinkProgram(m_shaderProgram);
+-  glGetProgramiv(m_shaderProgram, GL_LINK_STATUS, params);
+-  if (params[0]!=GL_TRUE)
++    // if we have a pixel shader, attach it. If not, fixed pipeline
++    // will be used.
++    if (m_pFP->Handle())
++    {
++      glAttachShader(m_shaderProgram, m_pFP->Handle());
++      VerifyGLState();
++    }
++
++#if defined(__ORBIS__)
++    // Piglet only exposes the attributes that were explicitly bound before
++    // linking a binary program; the PSSL attribute table describes the
++    // interface but does not assign the GL locations.  These indices match
++    // the resourceindex values generated by gen-shader-bins.py.
++    glBindAttribLocation(m_shaderProgram, 0, "m_attrpos");
++    glBindAttribLocation(m_shaderProgram, 1, "m_attrcol");
++    glBindAttribLocation(m_shaderProgram, 2, "m_attrcord0");
++    glBindAttribLocation(m_shaderProgram, 3, "m_attrcord1");
++    glBindAttribLocation(m_shaderProgram, 4, "m_attrsnap");
++    // Composite shader uses a different pair of names.
++    glBindAttribLocation(m_shaderProgram, 0, "a_pos");
++    glBindAttribLocation(m_shaderProgram, 1, "a_tex");
++#endif
++
++    glLinkProgram(m_shaderProgram);
++    glGetProgramiv(m_shaderProgram, GL_LINK_STATUS, params);
++    return params[0] == GL_TRUE;
++  };
++
++  if (!CreateAndLink())
+   {
+-    GLchar log[LOG_SIZE];
++    GLchar log[LOG_SIZE] = {};
+     CLog::Log(LOGERROR, "GL: Error linking shader");
+     glGetProgramInfoLog(m_shaderProgram, LOG_SIZE, NULL, log);
+     CLog::Log(LOGERROR, "{}", log);
++#if defined(__ORBIS__)
++    // A/B experiment: try the alternative blob sets in one console run.
++    for (int variant = 1; variant <= 4; ++variant)
++    {
++      CLog::Log(LOGERROR, "PS4GL: link failed; retrying shader variant {}", variant);
++      PS4_SetShaderVariant(variant);
++      Free();
++      if (!m_pVP->Compile() || !m_pFP->Compile())
++      {
++        CLog::Log(LOGERROR, "PS4GL: variant {} failed to compile", variant);
++        continue;
++      }
++      if (CreateAndLink())
++      {
++        CLog::Log(LOGERROR, "PS4GL: shader variant {} linked", variant);
++        VerifyGLState();
++        m_validated = false;
++        m_ok = true;
++        OnCompiledAndLinked();
++        VerifyGLState();
++        return true;
++      }
++      log[0] = '\0';
++      if (m_shaderProgram)
++        glGetProgramInfoLog(m_shaderProgram, LOG_SIZE, NULL, log);
++      CLog::Log(LOGERROR, "PS4GL: variant {} link failed: {}", variant, log);
++    }
++    PS4_SetShaderVariant(0);
++#endif
+     goto error;
+   }
+   VerifyGLState();
+diff --git a/xbmc/platform/ps4/PS4ShaderBin.cpp b/xbmc/platform/ps4/PS4ShaderBin.cpp
+new file mode 100644
+index 0000000000..556e34adda
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4ShaderBin.cpp
+@@ -0,0 +1,148 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "platform/ps4/PS4ShaderBin.h"
++
++#if defined(__ORBIS__)
++
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++#include <GLES2/gl2.h>
++
++#include "filesystem/File.h"
++#include "utils/log.h"
++
++namespace {
++
++unsigned int HashBuf(const char* buf, unsigned int len)
++{
++  unsigned int h = 5381;
++  for (unsigned int i = 0; i < len; i++)
++    h = ((h << 5) + h) + static_cast<unsigned char>(buf[i]);
++  return h;
++}
++
++int g_variant = -1;
++
++int ShaderVariant()
++{
++  if (g_variant >= 0)
++    return g_variant;
++
++  g_variant = 0;
++  FILE* f = fopen("/data/kodi-ps4/shader-variant.txt", "r");
++  if (f)
++  {
++    int v = 0;
++    if (fscanf(f, "%d", &v) == 1 && v >= 0 && v <= 9)
++      g_variant = v;
++    fclose(f);
++  }
++
++  return g_variant;
++}
++
++std::string BlobPath(unsigned int hash, const char* src, unsigned int srcLen,
++                     unsigned int shaderType)
++{
++  // The YV12 video shaders get stable names.  The hash path can silently
++  // pick an older blob when Kodi's final source assembly changes (the old
++  // blob then samples m_cordU/m_cordV and produces green/white chroma).
++  if (shaderType == GL_FRAGMENT_SHADER && src && srcLen)
++  {
++    const std::string source(src, srcLen);
++    // Exact match: the YV12_HI shader also contains "#define XBMC_YV12"
++    // as a prefix.  Loading the 8-bit blob for a 10-bit frame would make
++    // the renderer sample R8 textures through the R16 path.
++    if (source.find("#define XBMC_YV12\n") != std::string::npos ||
++        source.find("#define XBMC_YV12\r\n") != std::string::npos)
++    {
++      const char* name = source.find("m_field") != std::string::npos ? "yv12_bob.bin"
++                                                                    : "yv12_basic.bin";
++      return "special://xbmc/system/shaders/bin/" + std::string(name);
++    }
++    if (source.find("#define XBMC_NV12\n") != std::string::npos ||
++        source.find("#define XBMC_NV12\r\n") != std::string::npos)
++    {
++      const char* name = source.find("m_field") != std::string::npos ? "nv12_bob.bin"
++                                                                    : "nv12_basic.bin";
++      return "special://xbmc/system/shaders/bin/" + std::string(name);
++    }
++    if (source.find("#define XBMC_PS4_PACKED\n") != std::string::npos ||
++        source.find("#define XBMC_PS4_PACKED\r\n") != std::string::npos)
++    {
++      const char* name = source.find("m_field") != std::string::npos ? "packed_bob.bin"
++                                                                    : "packed_basic.bin";
++      return "special://xbmc/system/shaders/bin/" + std::string(name);
++    }
++  }
++
++  char name[16];
++  snprintf(name, sizeof(name), "%08x.bin", hash);
++  const int variant = ShaderVariant();
++  if (variant == 0)
++    return "special://xbmc/system/shaders/bin/" + std::string(name);
++  return "special://xbmc/system/shaders/bin/v" + std::to_string(variant) + "/" +
++         std::string(name);
++}
++
++} // unnamed namespace
++
++extern "C" void PS4_SetShaderVariant(int variant)
++{
++  if (variant < 0 || variant > 9)
++    variant = 0;
++  g_variant = variant;
++}
++
++bool PS4_LoadShaderBinary(unsigned int shader, const char* src, unsigned int srcLen,
++                          unsigned int shaderType, unsigned int* outHash)
++{
++  const unsigned int hash = HashBuf(src, srcLen);
++
++  XFILE::CFile file;
++  const std::string path = BlobPath(hash, src, srcLen, shaderType);
++  if (!file.Open(path))
++  {
++    CLog::Log(LOGERROR, "PS4 shaderbin: missing {:08x} ({})", hash, path);
++    if (outHash)
++      *outHash = hash;
++    return false;
++  }
++
++  // PS4's fstat() can report a wrong file size, so read until EOF.
++  std::string raw;
++  {
++    char chunk[4096];
++    int n;
++    while ((n = file.Read(chunk, sizeof(chunk))) > 0)
++      raw.append(chunk, static_cast<size_t>(n));
++  }
++  file.Close();
++  const unsigned int rawSize = static_cast<unsigned int>(raw.size());
++  if (rawSize <= sizeof(unsigned int))
++  {
++    if (outHash)
++      *outHash = hash;
++    return false;
++  }
++
++  unsigned int format = 0;
++  std::memcpy(&format, raw.data(), sizeof(format));
++  const int blobSize = static_cast<int>(rawSize - sizeof(format));
++
++  while (glGetError() != GL_NO_ERROR)
++  {
++  }
++  glShaderBinary(1, &shader, 0, raw.data() + sizeof(format), blobSize);
++  return true;
++}
++
++#endif // __ORBIS__
+diff --git a/xbmc/platform/ps4/PS4ShaderBin.h b/xbmc/platform/ps4/PS4ShaderBin.h
+new file mode 100644
+index 0000000000..c53efcf062
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4ShaderBin.h
+@@ -0,0 +1,45 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++
++#if defined(__ORBIS__)
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Piglet has no runtime GLSL compiler, so GLSL shaders must ship as
++ * precompiled Piglet Shader Binary blobs (glShaderBinary). Blobs are keyed
++ * by a djb2 hash of the final shader source (prefix included), exactly like
++ * the ioQuake3-PS4 scheme; the blob layout is
++ *   [GLenum format][Piglet container]
++ * with the container embedding the original GLSL source and the compiled
++ * PSB section.
++ *
++ * LoadShaderBinary hashes `src`, looks for
++ * special://xbmc/system/shaders/bin/<hash>.bin and hands the blob to
++ * glShaderBinary. Returns true if a blob was found and passed to GL; the
++ * caller still checks GL_COMPILE_STATUS the normal way. When it returns
++ * false, *outHash holds the missing hash so the log can name it.
++ */
++bool PS4_LoadShaderBinary(unsigned int shader, const char* src, unsigned int srcLen,
++                          unsigned int shaderType, unsigned int* outHash);
++
++/* A/B experiment hook: 0 = bin/, 1..9 = bin/v<N>/.  The override wins over
++ * /data/kodi-ps4/shader-variant.txt for the rest of the process. */
++void PS4_SetShaderVariant(int variant);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // __ORBIS__
+diff --git a/xbmc/rendering/GLExtensions.cpp b/xbmc/rendering/GLExtensions.cpp
+index 2b453ca424..750ddce1dc 100644
+--- a/xbmc/rendering/GLExtensions.cpp
++++ b/xbmc/rendering/GLExtensions.cpp
+@@ -11,22 +11,29 @@
+ #include "ServiceBroker.h"
+ #include "rendering/RenderSystem.h"
+ 
+-#include <ranges>
+-#include <unordered_set>
++#include <array>
++#include <mutex>
+ 
+ bool CGLExtensions::IsExtensionSupported(CGLExtensions::Extension extension)
+ {
+-  static const std::unordered_set<CGLExtensions::Extension> supportedExtensions = []()
+-  {
+-    auto isExtSupported = [](const auto& tmp)
+-    { return CServiceBroker::GetRenderSystem()->IsExtSupported(std::string(tmp.second).c_str()); };
+-    // clang-format off
+-    auto supportedExtensions = CGLExtensions::stringMap | std::views::filter(isExtSupported)
+-                                                        | std::views::keys;
+-    // clang-format on
+-    return std::unordered_set<CGLExtensions::Extension>(supportedExtensions.begin(),
+-                                                        supportedExtensions.end());
+-  }();
++  const auto index = static_cast<size_t>(extension);
++  if (index >= static_cast<size_t>(EXTENSION_MAX))
++    return false;
+ 
+-  return supportedExtensions.contains(extension);
++  // Use a fixed-size table instead of a function-local unordered_set: the
++  // texture path calls this while another thread may be initialising the
++  // table, and the set's heap-allocated bucket array was observed as null on
++  // PS4.  call_once provides the synchronisation without dynamic allocation.
++  static std::array<bool, static_cast<size_t>(EXTENSION_MAX)> supportedExtensions{};
++  static std::once_flag once;
++  std::call_once(once,
++                 []()
++                 {
++                   for (const auto& [ext, name] : CGLExtensions::stringMap)
++                     supportedExtensions[static_cast<size_t>(ext)] =
++                         CServiceBroker::GetRenderSystem()->IsExtSupported(
++                             std::string(name).c_str());
++                 });
++
++  return supportedExtensions[index];
+ }
+diff --git a/xbmc/rendering/gles/GLESShader.cpp b/xbmc/rendering/gles/GLESShader.cpp
+index 08ff1fa245..8d36100945 100644
+--- a/xbmc/rendering/gles/GLESShader.cpp
++++ b/xbmc/rendering/gles/GLESShader.cpp
+@@ -62,10 +62,27 @@ void CGLESShader::OnCompiledAndLinked()
+   m_hPma = glGetUniformLocation(ProgramHandle(), "m_pma");
+ 
+   // Vertex attributes
+-  m_hPos    = glGetAttribLocation(ProgramHandle(),  "m_attrpos");
+-  m_hCol    = glGetAttribLocation(ProgramHandle(),  "m_attrcol");
+-  m_hCord0  = glGetAttribLocation(ProgramHandle(),  "m_attrcord0");
+-  m_hCord1  = glGetAttribLocation(ProgramHandle(),  "m_attrcord1");
++  const GLint rawPos = glGetAttribLocation(ProgramHandle(), "m_attrpos");
++  const GLint rawCol = glGetAttribLocation(ProgramHandle(), "m_attrcol");
++  const GLint rawCord0 = glGetAttribLocation(ProgramHandle(), "m_attrcord0");
++  const GLint rawCord1 = glGetAttribLocation(ProgramHandle(), "m_attrcord1");
++  m_hPos = rawPos;
++  m_hCol = rawCol;
++  m_hCord0 = rawCord0;
++  m_hCord1 = rawCord1;
++#if defined(__ORBIS__)
++  // Piglet does not report binary-program attributes through
++  // glGetAttribLocation.  Use the locations bound before linking (which
++  // match the PSSL resourceindex values) as the fallback.
++  if (m_hPos < 0)
++    m_hPos = 0;
++  if (m_hCol < 0)
++    m_hCol = 1;
++  if (m_hCord0 < 0)
++    m_hCord0 = 2;
++  if (m_hCord1 < 0)
++    m_hCord1 = 3;
++#endif
+ 
+   // It's okay to do this only one time. Textures units never change.
+   glUseProgram( ProgramHandle() );
+diff --git a/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp b/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
+index 77dc71381a..56d090e8c9 100644
+--- a/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
++++ b/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
+@@ -58,6 +58,14 @@ void CGuiCompositeShaderGLES::OnCompiledAndLinked()
+ {
+   m_hPos = glGetAttribLocation(ProgramHandle(), "a_pos");
+   m_hTex = glGetAttribLocation(ProgramHandle(), "a_tex");
++#if defined(__ORBIS__)
++  // See CGLESShader::OnCompiledAndLinked: binary programs do not report
++  // attribute locations, so fall back to the pre-link bindings.
++  if (m_hPos < 0)
++    m_hPos = 0;
++  if (m_hTex < 0)
++    m_hTex = 1;
++#endif
+   m_hSamp = glGetUniformLocation(ProgramHandle(), "u_samp");
+   m_hLutDegamma = glGetUniformLocation(ProgramHandle(), "u_lutDegamma");
+   m_hLutTF = glGetUniformLocation(ProgramHandle(), "u_lutTF");
+diff --git a/xbmc/rendering/gles/RenderSystemGLES.cpp b/xbmc/rendering/gles/RenderSystemGLES.cpp
+index 6036c2251e..80c5591ab6 100644
+--- a/xbmc/rendering/gles/RenderSystemGLES.cpp
++++ b/xbmc/rendering/gles/RenderSystemGLES.cpp
+@@ -275,7 +275,17 @@ void CRenderSystemGLES::PresentRender(bool rendered, bool videoLayer)
+ 
+   // if video is rendered to a separate layer, we should not block this thread
+   if (!rendered && !videoLayer)
++  {
++#if defined(__ORBIS__)
++    // The PS4 flip already blocks until the next vsync.  Sleeping another
++    // 40 ms on top of that capped the idle loop at 20 fps and added up to
++    // ~50 ms of latency to the first button press.  Keep a short sleep so
++    // the loop still yields, but poll input at ~50 fps when idle.
++    KODI::TIME::Sleep(10ms);
++#else
+     KODI::TIME::Sleep(40ms);
++#endif
++  }
+ }
+ 
+ void CRenderSystemGLES::SetVSync(bool enable)
+diff --git a/xbmc/windowing/ps4/CMakeLists.txt b/xbmc/windowing/ps4/CMakeLists.txt
+new file mode 100644
+index 0000000000..4ee414487a
+--- /dev/null
++++ b/xbmc/windowing/ps4/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(SOURCES WinSystemPs4GLES.cpp
++            VideoSyncPs4.cpp)
++set(HEADERS WinSystemPs4GLES.h
++            VideoSyncPs4.h)
++core_add_library(windowing_ps4)
+diff --git a/xbmc/windowing/ps4/VideoSyncPs4.cpp b/xbmc/windowing/ps4/VideoSyncPs4.cpp
+new file mode 100644
+index 0000000000..f2562756f6
+--- /dev/null
++++ b/xbmc/windowing/ps4/VideoSyncPs4.cpp
+@@ -0,0 +1,85 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "VideoSyncPs4.h"
++
++#include "ServiceBroker.h"
++#include "cores/VideoPlayer/VideoReferenceClock.h"
++#include "threads/Thread.h"
++#include "utils/TimeUtils.h"
++#include "utils/log.h"
++#include "windowing/GraphicContext.h"
++#include "windowing/WinSystem.h"
++
++#include <chrono>
++#include <thread>
++
++// Provided by libglshim: number of flips actually scanned out by VideoOut.
++extern "C" uint64_t glShimGetFlipCount(void);
++
++CVideoSyncPs4::CVideoSyncPs4(CVideoReferenceClock* clock) : CVideoSync(clock) {}
++
++bool CVideoSyncPs4::Setup()
++{
++  m_abort = false;
++  m_lastFlip = glShimGetFlipCount();
++  CLog::Log(LOGDEBUG, "CVideoSyncPs4::{}: setting up (flips={})", __FUNCTION__, m_lastFlip);
++  return true;
++}
++
++void CVideoSyncPs4::Run(CEvent& stopEvent)
++{
++  // The vblank clock is timing sensitive; keep the polling thread above
++  // normal priority like the other Kodi VideoSync implementations.
++  CThread::GetCurrentThread()->SetPriority(ThreadPriority::ABOVE_NORMAL);
++
++  while (!stopEvent.Signaled() && !m_abort)
++  {
++    // VideoOut does not expose a portable vblank event queue to the shim
++    // yet; polling the hardware flip counter is enough to drive Kodi's
++    // reference clock and avoids sharing the render flip queue.
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++
++    const uint64_t flips = glShimGetFlipCount();
++    if (flips == 0)
++      continue;
++
++    if (m_lastFlip == 0)
++    {
++      m_lastFlip = flips;
++      continue;
++    }
++
++    if (flips == m_lastFlip)
++      continue;
++
++    const uint64_t delta = flips - m_lastFlip;
++    m_lastFlip = flips;
++    m_refClock->UpdateClock(static_cast<int>(delta), CurrentHostCounter());
++  }
++}
++
++void CVideoSyncPs4::Cleanup()
++{
++  CLog::Log(LOGDEBUG, "CVideoSyncPs4::{}: cleaning up", __FUNCTION__);
++}
++
++float CVideoSyncPs4::GetFps()
++{
++  m_fps = CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS();
++  if (m_fps <= 0.0f)
++    m_fps = 60.0f;
++  CLog::Log(LOGDEBUG, "CVideoSyncPs4::{}: fps:{}", __FUNCTION__, m_fps);
++  return m_fps;
++}
++
++void CVideoSyncPs4::RefreshChanged()
++{
++  if (m_fps != CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS())
++    m_abort = true;
++}
+diff --git a/xbmc/windowing/ps4/VideoSyncPs4.h b/xbmc/windowing/ps4/VideoSyncPs4.h
+new file mode 100644
+index 0000000000..74e3438e5b
+--- /dev/null
++++ b/xbmc/windowing/ps4/VideoSyncPs4.h
+@@ -0,0 +1,33 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "windowing/VideoSync.h"
++
++#include <atomic>
++#include <cstdint>
++
++class CVideoSyncPs4 : public CVideoSync
++{
++public:
++  explicit CVideoSyncPs4(CVideoReferenceClock* clock);
++  CVideoSyncPs4() = delete;
++  ~CVideoSyncPs4() override = default;
++
++  // CVideoSync overrides
++  bool Setup() override;
++  void Run(CEvent& stopEvent) override;
++  void Cleanup() override;
++  float GetFps() override;
++  void RefreshChanged() override;
++
++private:
++  uint64_t m_lastFlip = 0;
++  std::atomic<bool> m_abort{false};
++};
+diff --git a/xbmc/windowing/ps4/WinSystemPs4GLES.cpp b/xbmc/windowing/ps4/WinSystemPs4GLES.cpp
+new file mode 100644
+index 0000000000..e8d4a7f431
+--- /dev/null
++++ b/xbmc/windowing/ps4/WinSystemPs4GLES.cpp
+@@ -0,0 +1,358 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "windowing/ps4/WinSystemPs4GLES.h"
++
++#include "VideoSyncPs4.h"
++#include "ServiceBroker.h"
++#include "cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h"
++#include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
++#include "filesystem/CurlFile.h"
++#include "platform/ps4/PS4HardwareProfile.h"
++#include "settings/DisplaySettings.h"
++#include "utils/log.h"
++#include "windowing/GraphicContext.h"
++#include "windowing/WindowSystemFactory.h"
++
++#if defined(__ORBIS__)
++extern "C" {
++#include <orbis/Sysmodule.h>
++#include <orbis/SystemService.h>
++#include <orbis/libkernel.h>
++}
++#include <GLES2/gl2.h>
++#endif
++
++#include <cstdio>
++#include <cstring>
++#include <sys/resource.h>
++
++#if defined(__ORBIS__)
++extern "C" uint64_t glShimGetVideoOutCapability(void);
++
++static bool HideSystemSplash()
++{
++  sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
++  const int rc = sceSystemServiceHideSplashScreen();
++  return rc >= 0;
++}
++
++// Hide the system splash before Kodi draws its first frame.
++static void HideSystemSplashBeforeFirstFrame()
++{
++  HideSystemSplash();
++}
++#endif
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace PS4
++{
++
++void CWinSystemPs4GLES::Register()
++{
++  CWindowSystemFactory::RegisterWindowSystem(CreateWinSystem, "ps4");
++}
++
++std::unique_ptr<CWinSystemBase> CWinSystemPs4GLES::CreateWinSystem()
++{
++  return std::make_unique<CWinSystemPs4GLES>();
++}
++
++#if defined(__ORBIS__)
++bool CWinSystemPs4GLES::InitDisplay()
++{
++  m_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++  if (m_eglDisplay == EGL_NO_DISPLAY)
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglGetDisplay failed ({:#x})", eglGetError());
++    return false;
++  }
++
++  EGLint major = 0;
++  EGLint minor = 0;
++  if (!eglInitialize(m_eglDisplay, &major, &minor))
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglInitialize failed ({:#x})", eglGetError());
++    return false;
++  }
++  CLog::Log(LOGINFO, "CWinSystemPs4GLES: EGL {}.{} initialized", major, minor);
++
++  if (!eglBindAPI(EGL_OPENGL_ES_API))
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglBindAPI failed ({:#x})", eglGetError());
++    return false;
++  }
++  eglSwapInterval(m_eglDisplay, 0);
++  return true;
++}
++
++bool CWinSystemPs4GLES::CreateSurfaceAndContext()
++{
++  // The glshim EGL surface ignores the native window: it always owns the
++  // full 1920x1080 VideoOut buffer.  Keep an explicit no-MSAA config so the
++  // attributes match what Kodi expects.
++  const EGLint attribs[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++                            EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 0, EGL_STENCIL_SIZE, 0,
++                            EGL_SAMPLE_BUFFERS, 0, EGL_SAMPLES, 0,
++                            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE,
++                            EGL_WINDOW_BIT, EGL_NONE};
++  EGLint numConfigs = 0;
++  if (!eglChooseConfig(m_eglDisplay, attribs, &m_eglConfig, 1, &numConfigs) || numConfigs < 1)
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglChooseConfig failed ({:#x})", eglGetError());
++    return false;
++  }
++
++  const EGLint surfaceAttribs[] = {EGL_RENDER_BUFFER, EGL_BACK_BUFFER, EGL_NONE};
++  m_eglSurface = eglCreateWindowSurface(m_eglDisplay, m_eglConfig, (EGLNativeWindowType)0, surfaceAttribs);
++  if (m_eglSurface == EGL_NO_SURFACE)
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglCreateWindowSurface failed ({:#x})", eglGetError());
++    return false;
++  }
++
++  const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
++  m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, contextAttribs);
++  if (m_eglContext == EGL_NO_CONTEXT)
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglCreateContext failed ({:#x})", eglGetError());
++    return false;
++  }
++
++  if (!eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext))
++  {
++    CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglMakeCurrent failed ({:#x})", eglGetError());
++    return false;
++  }
++
++  HideSystemSplashBeforeFirstFrame();
++  return true;
++}
++
++#endif // __ORBIS__
++
++bool CWinSystemPs4GLES::InitWindowSystem()
++{
++  if (!CWinSystemBase::InitWindowSystem())
++    return false;
++
++  // The video renderer registers itself through the factory; without this the
++  // "default" entry is missing and CRenderManager::Configure() has no renderer,
++  // so video playback stays on the GUI/busy dialog and never paints a frame.
++  VIDEOPLAYER::CRendererFactory::ClearRenderer();
++  CLinuxRendererGLES::Register();
++
++#if defined(__ORBIS__)
++  if (!InitDisplay())
++    return false;
++
++  const uint64_t videoOutCaps = glShimGetVideoOutCapability();
++  m_hdr10Supported = (videoOutCaps & 0x80) != 0;
++
++  KODI::PLATFORM::PS4::ProbeHardwareProfileVideo();
++  const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++  // hdr10 is the display capability; hdrAutomatic tells whether Kodi can
++  // switch to HDR.  The current renderer only writes SDR, so do not
++  // advertise HDR until real HDR output exists.
++  if (profile.videoValid && profile.videoCapsValid)
++    m_hdr10Supported = profile.hdr10 && profile.hdrAutomatic;
++  CLog::Log(LOGINFO,
++            "CWinSystemPs4GLES: HDR10 display={} output={} (VideoOut caps=0x{:x}, profile caps=0x{:x}, valid={})",
++            profile.hdr10, m_hdr10Supported, videoOutCaps, profile.videoCapabilities,
++            profile.videoCapsValid);
++  KODI::PLATFORM::PS4::LogHardwareProfile();
++  KODI::PLATFORM::PS4::ApplyConsoleLocaleSettings();
++
++  // curl has no default CA bundle on Orbis.  Load Kodi's cacert.pem into
++  // memory so every session sets CURLOPT_CAINFO_BLOB.
++  XFILE::CCurlFile::PreloadCaCertsBlob();
++#endif
++  return true;
++}
++
++bool CWinSystemPs4GLES::IsHDRDisplay()
++{
++  return m_hdr10Supported;
++}
++
++CHDRCapabilities CWinSystemPs4GLES::GetDisplayHDRCapabilities() const
++{
++  CHDRCapabilities caps;
++  if (m_hdr10Supported)
++    caps.SetHDR10();
++  return caps;
++}
++
++void CWinSystemPs4GLES::UpdateResolutions()
++{
++  CWinSystemBase::UpdateResolutions();
++
++  // The glshim render target is fixed at 1920x1080, so the GUI keeps that
++  // size and the TV/PS4 scaler handles 720p/4K output.  The refresh rate
++  // does come from the probed VideoOut mode.
++  const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++  double refresh = 59.94;
++  if (profile.videoValid && profile.refreshRate >= 23.0 && profile.refreshRate <= 60.0)
++    refresh = profile.refreshRate;
++  else if (profile.videoValid && profile.refreshRate > 60.0 && profile.refreshRate <= 120.0)
++    refresh = 59.94; // renderer is still 1080p60; do not chase 120 Hz yet
++
++  RESOLUTION_INFO res{};
++  res.iWidth = 1920;
++  res.iHeight = 1080;
++  res.iScreenWidth = 1920;
++  res.iScreenHeight = 1080;
++  res.fRefreshRate = static_cast<float>(refresh);
++  res.dwFlags = 0;
++  res.bFullScreen = true;
++  res.strMode = profile.videoWidth > 1920 || profile.videoHeight > 1080 ? "Full 1080p (TV 4K)"
++                                                                        : "Full 1080p@60";
++
++  CServiceBroker::GetWinSystem()->GetGfxContext().ResetOverscan(res);
++  CDisplaySettings::GetInstance().AddResolutionInfo(res);
++  CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = res;
++}
++
++bool CWinSystemPs4GLES::DestroyWindowSystem()
++{
++#if defined(__ORBIS__)
++  if (m_eglDisplay != EGL_NO_DISPLAY)
++  {
++    eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    if (m_eglSurface != EGL_NO_SURFACE)
++      eglDestroySurface(m_eglDisplay, m_eglSurface);
++    if (m_eglContext != EGL_NO_CONTEXT)
++      eglDestroyContext(m_eglDisplay, m_eglContext);
++    eglTerminate(m_eglDisplay);
++  }
++  m_eglSurface = EGL_NO_SURFACE;
++  m_eglContext = EGL_NO_CONTEXT;
++  m_eglDisplay = EGL_NO_DISPLAY;
++#endif
++  return CWinSystemBase::DestroyWindowSystem();
++}
++
++bool CWinSystemPs4GLES::CreateNewWindow(const std::string& name, bool fullScreen,
++                                        RESOLUTION_INFO& res)
++{
++  (void)name;
++
++  m_width = res.iWidth ? res.iWidth : 1920;
++  m_height = res.iHeight ? res.iHeight : 1080;
++
++#if defined(__ORBIS__)
++  if (!CreateSurfaceAndContext())
++    return false;
++
++  res.iScreenWidth = res.iWidth;
++  res.iScreenHeight = res.iHeight;
++  res.bFullScreen = true;
++  res.fRefreshRate = res.fRefreshRate > 0.0f ? res.fRefreshRate : 59.94f;
++
++#endif
++
++  m_bWindowCreated = true;
++  return true;
++}
++
++bool CWinSystemPs4GLES::DestroyWindow()
++{
++  m_bWindowCreated = false;
++  return true;
++}
++
++bool CWinSystemPs4GLES::ResizeWindow(int newWidth, int newHeight, int newLeft, int newTop)
++{
++  (void)newLeft;
++  (void)newTop;
++  m_width = newWidth;
++  m_height = newHeight;
++  return true;
++}
++
++bool CWinSystemPs4GLES::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res,
++                                      bool blankOtherDisplays)
++{
++  (void)fullScreen;
++  (void)blankOtherDisplays;
++  if (res.iWidth)
++  {
++    m_width = res.iWidth;
++    m_height = res.iHeight;
++  }
++  return true;
++}
++
++void CWinSystemPs4GLES::NotifyAppFocusChange(bool bGaining)
++{
++  (void)bGaining;
++}
++
++void CWinSystemPs4GLES::NotifyAppActiveChange(bool bActivated)
++{
++  (void)bActivated;
++}
++
++void CWinSystemPs4GLES::ShowOSMouse(bool show)
++{
++  (void)show;
++}
++
++void CWinSystemPs4GLES::FinishModeChange(RESOLUTION res)
++{
++  (void)res;
++}
++
++void CWinSystemPs4GLES::SetDirtyRegions(const CDirtyRegionList& dirtyRegionsList)
++{
++  (void)dirtyRegionsList;
++}
++
++void CWinSystemPs4GLES::Register(IDispResource* resource)
++{
++  (void)resource;
++}
++
++void CWinSystemPs4GLES::Unregister(IDispResource* resource)
++{
++  (void)resource;
++}
++
++std::unique_ptr<CVideoSync> CWinSystemPs4GLES::GetVideoSync(CVideoReferenceClock* clock)
++{
++  return std::make_unique<CVideoSyncPs4>(clock);
++}
++
++void CWinSystemPs4GLES::SetVSyncImpl(bool enable)
++{
++  (void)enable;
++#if defined(__ORBIS__)
++  // The VideoOut flip is synchronous; keep the interval at 0.
++  if (m_eglDisplay != EGL_NO_DISPLAY)
++    eglSwapInterval(m_eglDisplay, 0);
++#endif
++}
++
++void CWinSystemPs4GLES::PresentRenderImpl(bool rendered)
++{
++  (void)rendered;
++#if defined(__ORBIS__)
++  if (m_eglDisplay != EGL_NO_DISPLAY && m_eglSurface != EGL_NO_SURFACE)
++  {
++    if (!eglSwapBuffers(m_eglDisplay, m_eglSurface))
++      CLog::Log(LOGERROR, "CWinSystemPs4GLES: eglSwapBuffers failed ({:#x})", eglGetError());
++  }
++#endif
++}
++
++} // namespace PS4
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/ps4/WinSystemPs4GLES.h b/xbmc/windowing/ps4/WinSystemPs4GLES.h
+new file mode 100644
+index 0000000000..bcf6efb3f3
+--- /dev/null
++++ b/xbmc/windowing/ps4/WinSystemPs4GLES.h
+@@ -0,0 +1,72 @@
++/*
++ *  Copyright (C) 2026 OpenOrbis/Kodi PS4 port
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "windowing/WinSystem.h"
++#include "rendering/gles/RenderSystemGLES.h"
++#include "utils/HDRCapabilities.h"
++
++#include <EGL/egl.h>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace PS4
++{
++
++// The PS4 window system: libglshim provides the EGL/GLES implementation over
++// sceGnm, so this class owns the EGL display/surface/context and is also the
++// GLES render system that draws the GUI on it.
++class CWinSystemPs4GLES : public CWinSystemBase, public CRenderSystemGLES
++{
++public:
++  static void Register();
++  static std::unique_ptr<CWinSystemBase> CreateWinSystem();
++
++  const std::string GetName() override { return "ps4 (gnm GLES)"; }
++  CRenderSystemBase* GetRenderSystem() override { return this; }
++
++  bool InitWindowSystem() override;
++  bool DestroyWindowSystem() override;
++  bool CreateNewWindow(const std::string& name, bool fullScreen, RESOLUTION_INFO& res) override;
++  bool DestroyWindow() override;
++  bool ResizeWindow(int newWidth, int newHeight, int newLeft, int newTop) override;
++  bool SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays) override;
++  void NotifyAppFocusChange(bool bGaining) override;
++  void NotifyAppActiveChange(bool bActivated) override;
++  bool IsHDRDisplay() override;
++  CHDRCapabilities GetDisplayHDRCapabilities() const override;
++  std::unique_ptr<CVideoSync> GetVideoSync(CVideoReferenceClock* clock) override;
++  bool HasCursor() override { return false; }
++  void ShowOSMouse(bool show) override;
++  void FinishModeChange(RESOLUTION res) override;
++  void SetDirtyRegions(const CDirtyRegionList& dirtyRegionsList) override;
++  void Register(IDispResource* resource) override;
++  void Unregister(IDispResource* resource) override;
++
++protected:
++  void UpdateResolutions() override;
++  void SetVSyncImpl(bool enable) override;
++  void PresentRenderImpl(bool rendered) override;
++
++private:
++  bool InitDisplay();
++  bool CreateSurfaceAndContext();
++
++  EGLDisplay m_eglDisplay{EGL_NO_DISPLAY};
++  EGLSurface m_eglSurface{EGL_NO_SURFACE};
++  EGLContext m_eglContext{EGL_NO_CONTEXT};
++  EGLConfig m_eglConfig{nullptr};
++  bool m_hdr10Supported{false};
++};
++
++} // namespace PS4
++} // namespace WINDOWING
++} // namespace KODI

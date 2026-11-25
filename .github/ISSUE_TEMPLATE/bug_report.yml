@@ -1,0 +1,113 @@
+name: Bug report
+description: Report a reproducible problem in the Kodi PS4 port
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Please read `CONTRIBUTING.md` and `PRIVACY.md`
+        before submitting.
+
+        **Do not include** IP/MAC addresses, SSIDs, account names, user
+        paths, `userdata`, credentials, tokens or unsanitized logs. Use
+        placeholders such as `<console>` and `<host>`. Do not include
+        prompts, tool traces, model names or session identifiers.
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version and SHA-256
+      description: The package you installed and its SHA-256.
+      placeholder: "0.1.1aw / kodi-ps4-diag.pkg / <sha256>"
+    validations:
+      required: true
+
+  - type: input
+    id: console
+    attributes:
+      label: PS4 model and firmware
+      description: Model (fat/Slim/Pro) and system software version.
+      placeholder: "CUH-11xx / 13.52"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Ethernet
+        - Wi-Fi 2.4 GHz
+        - Wi-Fi 5 GHz
+        - Offline / local only
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps, including the screen and the addon if relevant.
+      placeholder: |
+        1. Launch Kodi
+        2. Open ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the error code (for example CE-34878-0) and whether it reproduces.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: |
+        Paste the relevant `kodi.log`, `crash.log`, `mem.log` or shim lines.
+        Remove personal data and console/network identifiers.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: memory
+    attributes:
+      label: Memory figures (if relevant)
+      description: "`flex`, `rssmax`, `alloc-fail`, `bad_alloc`."
+      placeholder: "flex=... MB, rssmax=... MB, alloc-fail=0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Addons, PVR, Python, input device, video format, etc.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy checklist
+      options:
+        - label: I removed personal data, IP/MAC addresses, SSIDs, user paths, credentials and unsanitized logs.
+          required: true
+        - label: I did not include prompts, tool traces, model names or session identifiers.
+          required: true
+        - label: I searched existing issues and the documentation.
+          required: true

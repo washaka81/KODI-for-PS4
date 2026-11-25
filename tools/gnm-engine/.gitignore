@@ -1,0 +1,12 @@
+*.o
+*.spv
+eboot.bin
+gnm_engine
+gnm_engine.oelf
+pkg.gp4
+*.pkg
+sce_module/*.prx
+sce_sys/icon0.png
+sce_sys/about/right.sprx
+glshim_test
+glshim_test.oelf

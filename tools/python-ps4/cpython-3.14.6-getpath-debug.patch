@@ -1,0 +1,188 @@
+--- a/Modules/getpath.c
++++ b/Modules/getpath.c
+@@ -337,6 +337,8 @@
+ }
+ 
+ 
++static void ps4_log_readlines_error(const wchar_t *path, int err);
++
+ static PyObject *
+ getpath_readlines(PyObject *Py_UNUSED(self), PyObject *args)
+ {
+@@ -352,6 +354,12 @@
+     }
+     FILE *fp = _Py_wfopen(path, L"rb");
+     if (!fp) {
++        int err = errno;
++        ps4_log_readlines_error(path, err);
++        if (err == EINVAL) {
++            err = ENOENT;
++        }
++        errno = err;
+         PyErr_SetFromErrno(PyExc_OSError);
+         PyMem_Free((void *)path);
+         return NULL;
+@@ -852,6 +860,144 @@
+    safe because already-configured values are not recalculated. To
+    actually recalculate paths, you need a clean PyConfig.
+ */
++/* PS4 getpath diagnostics: the canary only reports the generic
++ * "error evaluating path"; write the real Python exception and the
++ * PyConfig paths to a file the console can retrieve over FTP. */
++
++static void
++ps4_log_wide(FILE *f, const char *name, const wchar_t *value)
++{
++    if (value == NULL) {
++        fprintf(f, "%s=(null)\n", name);
++        return;
++    }
++    PyObject *u = PyUnicode_FromWideChar(value, -1);
++    if (u == NULL) {
++        PyErr_Clear();
++        fprintf(f, "%s=(decode-failed)\n", name);
++        return;
++    }
++    const char *s = PyUnicode_AsUTF8(u);
++    if (s == NULL) {
++        PyErr_Clear();
++        s = "(utf8-failed)";
++    }
++    fprintf(f, "%s=%s\n", name, s);
++    Py_DECREF(u);
++}
++
++static void
++ps4_log_readlines_error(const wchar_t *path, int err)
++{
++    FILE *f = fopen("/data/kodi-ps4/python-getpath.log", "a");
++    if (f == NULL) {
++        return;
++    }
++    fprintf(f, "--- readlines failed: errno=%d ---\n", err);
++    ps4_log_wide(f, "path", path);
++    fflush(f);
++    fclose(f);
++}
++
++static void
++ps4_log_getpath_config(PyConfig *config)
++{
++    FILE *f = fopen("/data/kodi-ps4/python-getpath.log", "a");
++    if (f == NULL) {
++        return;
++    }
++    fprintf(f, "--- getpath config ---\n");
++    ps4_log_wide(f, "home", config->home);
++    ps4_log_wide(f, "program_name", config->program_name);
++    ps4_log_wide(f, "executable", config->executable);
++    ps4_log_wide(f, "base_executable", config->base_executable);
++    ps4_log_wide(f, "prefix", config->prefix);
++    ps4_log_wide(f, "exec_prefix", config->exec_prefix);
++    ps4_log_wide(f, "base_prefix", config->base_prefix);
++    ps4_log_wide(f, "base_exec_prefix", config->base_exec_prefix);
++    fprintf(f, "use_environment=%d isolated=%d site_import=%d\n",
++            config->use_environment, config->isolated, config->site_import);
++    fflush(f);
++    fclose(f);
++}
++
++static void
++ps4_log_traceback(FILE *f, PyObject *tb)
++{
++    PyObject *cur = Py_NewRef(tb);
++    for (int depth = 0; cur != NULL && depth < 16; depth++) {
++        PyObject *frame = PyObject_GetAttrString(cur, "tb_frame");
++        PyObject *lineno = PyObject_GetAttrString(cur, "tb_lineno");
++        if (frame != NULL) {
++            PyObject *code = PyObject_GetAttrString(frame, "f_code");
++            if (code != NULL) {
++                PyObject *filename = PyObject_GetAttrString(code, "co_filename");
++                PyObject *name = PyObject_GetAttrString(code, "co_name");
++                const char *fname = filename != NULL ? PyUnicode_AsUTF8(filename) : NULL;
++                const char *func = name != NULL ? PyUnicode_AsUTF8(name) : NULL;
++                long line = lineno != NULL ? PyLong_AsLong(lineno) : -1;
++                fprintf(f, "frame=%s:%ld in %s\n",
++                        fname != NULL ? fname : "?", line,
++                        func != NULL ? func : "?");
++                Py_XDECREF(filename);
++                Py_XDECREF(name);
++                Py_DECREF(code);
++            }
++            Py_XDECREF(lineno);
++            Py_DECREF(frame);
++        }
++        PyObject *next = PyObject_GetAttrString(cur, "tb_next");
++        Py_DECREF(cur);
++        cur = next;
++        if (cur == Py_None) {
++            Py_DECREF(cur);
++            cur = NULL;
++        }
++        PyErr_Clear();
++    }
++    Py_XDECREF(cur);
++}
++
++static void
++ps4_log_getpath_error(const char *stage)
++{
++    PyObject *type = NULL, *value = NULL, *tb = NULL;
++    PyErr_Fetch(&type, &value, &tb);
++
++    FILE *f = fopen("/data/kodi-ps4/python-getpath.log", "a");
++    if (f != NULL) {
++        fprintf(f, "--- getpath error: %s ---\n", stage);
++        if (type != NULL) {
++            PyObject *s = PyObject_Str(type);
++            const char *cs = s != NULL ? PyUnicode_AsUTF8(s) : NULL;
++            if (cs == NULL) {
++                PyErr_Clear();
++                cs = "(?)";
++            }
++            fprintf(f, "type=%s\n", cs);
++            Py_XDECREF(s);
++        }
++        if (value != NULL) {
++            PyObject *s = PyObject_Str(value);
++            const char *cs = s != NULL ? PyUnicode_AsUTF8(s) : NULL;
++            if (cs == NULL) {
++                PyErr_Clear();
++                cs = "(?)";
++            }
++            fprintf(f, "value=%s\n", cs);
++            Py_XDECREF(s);
++        }
++        if (tb != NULL) {
++            fprintf(f, "traceback=present\n");
++            ps4_log_traceback(f, tb);
++        }
++        fflush(f);
++        fclose(f);
++    }
++    PyErr_Clear();
++    PyErr_Restore(type, value, tb);
++}
++
+ PyStatus
+ _PyConfig_InitPathConfig(PyConfig *config, int compute_path_config)
+ {
+@@ -955,15 +1101,18 @@
+     ) {
+         Py_DECREF(co);
+         Py_DECREF(dict);
++        ps4_log_getpath_error("initial values");
+         PyErr_FormatUnraisable("Exception ignored while preparing getpath");
+         return PyStatus_Error("error evaluating initial values");
+     }
+ 
++    ps4_log_getpath_config(config);
+     PyObject *r = PyEval_EvalCode(co, dict, dict);
+     Py_DECREF(co);
+ 
+     if (!r) {
+         Py_DECREF(dict);
++        ps4_log_getpath_error("path");
+         PyErr_FormatUnraisable("Exception ignored while running getpath");
+         return PyStatus_Error("error evaluating path");
+     }

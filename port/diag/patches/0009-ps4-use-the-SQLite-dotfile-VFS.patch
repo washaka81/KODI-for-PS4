@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 18:59:26 -0300
+Subject: [PATCH 09/12] ps4: use the SQLite dotfile VFS
+
+Orbis has no POSIX advisory locks, so the default unix VFS fails with SQLITE_IOERR_LOCK. Select the ps4-trace VFS, which wraps unix-dotfile and tracks the file size because fstat() is unreliable on the console.
+---
+ xbmc/dbwrappers/sqlitedataset.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/dbwrappers/sqlitedataset.cpp b/xbmc/dbwrappers/sqlitedataset.cpp
+index 690f890e37..49526b6175 100644
+--- a/xbmc/dbwrappers/sqlitedataset.cpp
++++ b/xbmc/dbwrappers/sqlitedataset.cpp
+@@ -27,6 +27,10 @@
+ 
+ #include <sqlite3.h>
+ 
++#if defined(__ORBIS__)
++extern "C" void ps4_register_trace_vfs(void);
++#endif
++
+ using namespace std::chrono_literals;
+ 
+ namespace
+@@ -338,7 +342,20 @@ int SqliteDatabase::connect(bool create)
+     int flags = SQLITE_OPEN_READWRITE;
+     if (create)
+       flags |= SQLITE_OPEN_CREATE;
+-    int errorCode = sqlite3_open_v2(db_fullpath.c_str(), &conn, flags, nullptr);
++#if defined(__ORBIS__)
++    // PS4 has no POSIX advisory locks; use the dotfile VFS.  The ps4-trace
++    // wrapper also tracks the file size because fstat() lies on Orbis.
++    static bool traceVfsRegistered = false;
++    if (!traceVfsRegistered)
++    {
++      ps4_register_trace_vfs();
++      traceVfsRegistered = true;
++    }
++    const char* vfsName = "ps4-trace";
++#else
++    const char* vfsName = nullptr;
++#endif
++    int errorCode = sqlite3_open_v2(db_fullpath.c_str(), &conn, flags, vfsName);
+     if (errorCode == SQLITE_CANTOPEN)
+     {
+       if (create)

@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:56:04 -0300
+Subject: [PATCH 08/12] ps4: keep the glshim trace hook as a no-op
+
+The glshim links WriteStartupTrace weakly. Define the hook without logging so the release build does not carry startup traces and the SELF link has no unresolved weak symbol.
+---
+ xbmc/platform/ps4/PlatformFreebsd.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/xbmc/platform/ps4/PlatformFreebsd.cpp b/xbmc/platform/ps4/PlatformFreebsd.cpp
+index cfda15874e..333d41d393 100644
+--- a/xbmc/platform/ps4/PlatformFreebsd.cpp
++++ b/xbmc/platform/ps4/PlatformFreebsd.cpp
+@@ -114,6 +114,11 @@ extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* at
+   return result;
+ }
+ 
++/* The glshim links this weak hook; the release build does not trace. */
++void WriteStartupTrace(const char*)
++{
++}
++
+ void PreparePS4Environment()
+ {
+   // The PS4 does not set HOME, the Kodi profile is kept next to the

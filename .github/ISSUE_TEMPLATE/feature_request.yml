@@ -1,0 +1,79 @@
+name: Feature request
+description: Propose a port, translator, addon or packaging improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project keeps Kodi as close to upstream as possible. Features
+        that change Kodi's logic, UI or behavior need a documented exception
+        in the relevant documentation and a maintainer decision.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What is missing or painful today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful change and where it belongs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - GLES/EGL shim or GNM/VideoOut
+        - Audio or input
+        - Network/TLS/DNS/FFmpeg translator
+        - Storage or packaging
+        - PVR/IPTV
+        - Addons or Python
+        - Documentation/tests
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does it change Kodi behavior or UI?
+      options:
+        - "No: translator/platform change only"
+        - "Yes: documented exception needed"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: How will this be tested on a real PS4? Which logs or measurements?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy checklist
+      options:
+        - label: I did not include personal data, credentials, IP/MAC addresses or user paths.
+          required: true
+        - label: I did not include prompts, tool traces, model names or session identifiers.
+          required: true

@@ -1,0 +1,1696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:35 -0300
+Subject: [PATCH 01/12] ps4: build and toolchain support
+
+Add the Orbis platform files, CMake glue and the FreeBSD/ELF toolchain fixes needed to configure and link Kodi for PS4. The internal FFmpeg build takes its dependency prefix from DEPS_PS4 instead of a hardcoded /tmp path.
+---
+ CMakeLists.txt                                |  36 ++-
+ cmake/modules/FindFFMPEG.cmake                |  18 ++
+ cmake/modules/FindTinyXML2.cmake              |   9 +-
+ cmake/platform/freebsd/ps4.cmake              |  13 ++
+ cmake/scripts/common/ArchSetup.cmake          |  44 ++--
+ cmake/scripts/freebsd/ArchSetup.cmake         |  18 +-
+ cmake/treedata/freebsd/ps4/subdirs.txt        |   2 +
+ cmake/treedata/freebsd/subdirs.txt            |   4 +-
+ .../Source/System/Bsd/NptBsdSockets.cpp       |   2 +-
+ ...-ffmpeg-all-ps4-socket-cloexec-retry.patch |  22 ++
+ ...010-ffmpeg-all-ps4-getaddrinfo-retry.patch |  36 +++
+ .../011-ffmpeg-all-ps4-tcp-tuning.patch       |  52 +++++
+ .../012-ffmpeg-all-ps4-dns-retry-ipv4.patch   |  68 ++++++
+ .../014-ffmpeg-all-ps4-tls-groups.patch       |  26 +++
+ tools/depends/target/ffmpeg/CMakeLists.txt    |  34 ++-
+ .../generic/ScriptInvocationManager.cpp       |  40 ++--
+ xbmc/pvr/addons/PVRClient.cpp                 | 212 +++++++++---------
+ 17 files changed, 475 insertions(+), 161 deletions(-)
+ create mode 100644 cmake/platform/freebsd/ps4.cmake
+ create mode 100644 cmake/treedata/freebsd/ps4/subdirs.txt
+ create mode 100644 tools/depends/target/ffmpeg/009-ffmpeg-all-ps4-socket-cloexec-retry.patch
+ create mode 100644 tools/depends/target/ffmpeg/010-ffmpeg-all-ps4-getaddrinfo-retry.patch
+ create mode 100644 tools/depends/target/ffmpeg/011-ffmpeg-all-ps4-tcp-tuning.patch
+ create mode 100644 tools/depends/target/ffmpeg/012-ffmpeg-all-ps4-dns-retry-ipv4.patch
+ create mode 100644 tools/depends/target/ffmpeg/014-ffmpeg-all-ps4-tls-groups.patch
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5b0432c456..d5541cd4c0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -90,6 +90,24 @@ include(cmake/scripts/common/ArchSetup.cmake)
+ include(cmake/scripts/common/Macros.cmake)
+ include(cmake/scripts/common/ProjectMacros.cmake)
+ core_find_versions()
++
++# PS4: EGL and GLES2 are provided by the Piglet library of the SDK.  The
++# find modules would import that library by path, which ends up as an
++# absolute path in DT_NEEDED, so the targets are created here and the
++# library is linked by name (see the toolchain file).
++if(CORE_PLATFORM_NAME STREQUAL "ps4")
++  # Marks the port for the code that is specific to the PS4.
++  add_definitions(-DTARGET_PS4)
++  add_library(${APP_NAME_LC}::OpenGLES INTERFACE IMPORTED)
++  set_target_properties(${APP_NAME_LC}::OpenGLES PROPERTIES
++                                                INTERFACE_INCLUDE_DIRECTORIES "${PS4SDK}/include"
++                                                INTERFACE_COMPILE_DEFINITIONS HAS_GLES=3)
++  add_library(${APP_NAME_LC}::EGL INTERFACE IMPORTED)
++  set_target_properties(${APP_NAME_LC}::EGL PROPERTIES
++                                              INTERFACE_INCLUDE_DIRECTORIES "${PS4SDK}/include"
++                                              INTERFACE_COMPILE_DEFINITIONS HAS_EGL)
++endif()
++
+ include(cmake/scripts/common/PathSetup.cmake)
+ include(cmake/scripts/common/CompilerSettings.cmake)
+ include(ExternalProject)
+@@ -244,9 +262,9 @@ endif()
+ 
+ # Required dependencies. Keep in alphabetical order please
+ set(required_deps ASS>=0.15.0
+-                  CrossGUID
++                  # CrossGUID disabled staging
+                   Curl
+-                  Exiv2
++                  # Exiv2 disabled for PS4 staging
+                   FFMPEG
+                   FlatBuffers
+                   Fmt
+@@ -255,7 +273,7 @@ set(required_deps ASS>=0.15.0
+                   Fstrcmp
+                   HarfBuzz
+                   Iconv
+-                  LibDvd
++                  # LibDvd disabled (host ioctls unavailable)
+                   Lzo2
+                   OpenSSL>=1.1.0
+                   PCRE2
+@@ -281,7 +299,7 @@ set(optional_deps Alsa>=1.0.27
+                   LircClient
+                   MDNS
+                   MicroHttpd>=0.9.40
+-                  NFS>=3.0.0
++                  # NFS disabled for PS4 staging
+                   Pipewire>=0.3.50
+                   Plist
+                   PulseAudio>=11.0.0
+@@ -320,7 +338,7 @@ if(NOT TARGET ${APP_NAME_LC}::MariaDBClient)
+   core_optional_dep(MySqlClient)
+ endif()
+ 
+-if(NOT TARGET ${APP_NAME_LC}::UDEV)
++if(NOT TARGET ${APP_NAME_LC}::UDEV AND NOT "ps4" IN_LIST CORE_PLATFORM_NAME_LC)
+   core_optional_dep(LibUSB)
+ endif()
+ 
+@@ -488,6 +506,14 @@ if(NOT CORE_SYSTEM_NAME STREQUAL android)
+     winstore_add_target_properties(${APP_NAME_LC})
+   endif()
+   add_executable(${APP_NAME_LC} ${CORE_MAIN_SOURCE} "${RESOURCES}" ${OTHER_FILES})
++  # The compiler driver adds libraries that the target does not use, the
++  # linker would record them in DT_NEEDED even when they are not needed.
++  target_link_options(${APP_NAME_LC} PRIVATE -Wl,--as-needed)
++  # Orbis links musl, whose pthread default stack is only 128 KiB.  Wrap the
++  # creator so every Kodi thread gets at least 2 MiB (PlatformFreebsd.cpp).
++  if(CMAKE_SYSTEM_NAME STREQUAL "Orbis")
++    target_link_options(${APP_NAME_LC} PRIVATE -Wl,--wrap=pthread_create)
++  endif()
+   set_target_properties(${APP_NAME_LC} PROPERTIES ENABLE_EXPORTS ON)
+ else()
+   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
+diff --git a/cmake/modules/FindFFMPEG.cmake b/cmake/modules/FindFFMPEG.cmake
+index ddddab1e77..3ba77021ae 100644
+--- a/cmake/modules/FindFFMPEG.cmake
++++ b/cmake/modules/FindFFMPEG.cmake
+@@ -41,6 +41,7 @@ macro(buildFFMPEG)
+   find_package(Dav1d ${LIB_DAV1D_VER} ${DAV1D_REQUIRED} ${SEARCH_QUIET})
+   if(NOT TARGET LIBRARY::Dav1d)
+     message(STATUS "dav1d not found, internal ffmpeg build will be missing AV1 support!")
++    set(FFMPEG_OPTIONS -DENABLE_DAV1D=OFF)
+   else()
+     set(FFMPEG_OPTIONS -DENABLE_DAV1D=ON)
+   endif()
+@@ -159,6 +160,7 @@ macro(buildFFMPEG)
+                      -DPKG_CONFIG_EXECUTABLE=${PKG_CONFIG_EXECUTABLE}
+                      -DCROSSCOMPILING=${CMAKE_CROSSCOMPILING}
+                      -DOS=${OS}
++                     -DNASM_EXECUTABLE=${NASM_EXECUTABLE}
+                      -DCMAKE_AR=${CMAKE_AR})
+     endif()
+ 
+@@ -185,6 +187,7 @@ macro(buildFFMPEG)
+                    -DFFMPEG_VER=${FFMPEG_VER}
+                    -DCORE_SYSTEM_NAME=${CORE_SYSTEM_NAME}
+                    -DCORE_PLATFORM_NAME=${CORE_PLATFORM_NAME_LC}
++                   -DDEPS_PS4=${DEPS_PS4}
+                    -DCPU=${CPU}
+                    -DENABLE_NEON=${ENABLE_NEON}
+                    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+@@ -207,6 +210,21 @@ macro(buildFFMPEG)
+                       COMMAND ${CMAKE_COMMAND} -E copy
+                       ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch
+                       <SOURCE_DIR>
++                      COMMAND ${CMAKE_COMMAND} -E copy
++                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/009-ffmpeg-all-ps4-socket-cloexec-retry.patch
++                      <SOURCE_DIR>
++                      COMMAND ${CMAKE_COMMAND} -E copy
++                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/010-ffmpeg-all-ps4-getaddrinfo-retry.patch
++                      <SOURCE_DIR>
++                      COMMAND ${CMAKE_COMMAND} -E copy
++                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/011-ffmpeg-all-ps4-tcp-tuning.patch
++                      <SOURCE_DIR>
++                      COMMAND ${CMAKE_COMMAND} -E copy
++                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/012-ffmpeg-all-ps4-dns-retry-ipv4.patch
++                      <SOURCE_DIR>
++                      COMMAND ${CMAKE_COMMAND} -E copy
++                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/014-ffmpeg-all-ps4-tls-groups.patch
++                      <SOURCE_DIR>
+     )
+ 
+     if(NOT DISABLE_FFMPEG_SOURCE_PLUGINS)
+diff --git a/cmake/modules/FindTinyXML2.cmake b/cmake/modules/FindTinyXML2.cmake
+index d0250db454..b7e5f585a7 100644
+--- a/cmake/modules/FindTinyXML2.cmake
++++ b/cmake/modules/FindTinyXML2.cmake
+@@ -16,15 +16,14 @@ if(NOT TARGET ${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME})
+   
+     find_package(Patch MODULE REQUIRED ${SEARCH_QUIET})
+   
+-    if(UNIX)
++    if(CMAKE_HOST_UNIX)
+       # ancient patch (Apple/freebsd) fails to patch tinyxml2 CMakeLists.txt file due to it being crlf encoded
+       # Strip crlf before applying patches.
+       # Freebsd fails even harder and requires both .patch and CMakeLists.txt to be crlf stripped
+       # possibly add requirement for freebsd on gpatch? Wouldnt need to copy/strip the patch file then
+-      set(PATCH_COMMAND sed -ie s|\\r\$|| ${CMAKE_BINARY_DIR}/${CORE_BUILD_DIR}/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/src/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/CMakeLists.txt
+-                COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/tools/depends/target/${${CMAKE_FIND_PACKAGE_NAME}_MODULE_LC}/001-debug-pdb.patch ${CMAKE_BINARY_DIR}/${CORE_BUILD_DIR}/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/src/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/001-debug-pdb.patch
+-                COMMAND sed -ie s|\\r\$|| ${CMAKE_BINARY_DIR}/${CORE_BUILD_DIR}/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/src/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/001-debug-pdb.patch
+-                COMMAND ${PATCH_EXECUTABLE} -p1 -i ${CMAKE_BINARY_DIR}/${CORE_BUILD_DIR}/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/src/${${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_BUILD_NAME}/001-debug-pdb.patch)
++      # Keep this as a single command: CMake 4.4 no longer expands a multi-command
++      # PATCH_COMMAND list correctly here, which dropped the sed/cp steps.
++      set(PATCH_COMMAND /bin/sh -c "sed -i 's/\\r$//' CMakeLists.txt && ${PATCH_EXECUTABLE} -p1 -i ${CMAKE_SOURCE_DIR}/tools/depends/target/tinyxml2/001-debug-pdb.patch")
+     else()
+       set(PATCH_COMMAND ${PATCH_EXECUTABLE} -p1 -i ${CMAKE_SOURCE_DIR}/tools/depends/target/${${CMAKE_FIND_PACKAGE_NAME}_MODULE_LC}/001-debug-pdb.patch)
+     endif()
+diff --git a/cmake/platform/freebsd/ps4.cmake b/cmake/platform/freebsd/ps4.cmake
+new file mode 100644
+index 0000000000..ee6ce564ae
+--- /dev/null
++++ b/cmake/platform/freebsd/ps4.cmake
+@@ -0,0 +1,13 @@
++# PS4 Piglet platform: no X11/DRM/GL, only GLES through Piglet/EGL.
++set(PLATFORM_REQUIRED_DEPS EGL OpenGLES)
++set(PLATFORM_OPTIONAL_DEPS)
++set(PLATFORM_OPTIONAL_PACKAGES)
++set(PLATFORM_REQUIRED_TOOLS)
++set(PLATFORM_OPTIONAL_DEPS_EXCLUDE OpenGl OpenGLGL GL Bluray
++    # Host only dependencies: pkg-config finds them on the build machine, but
++    # the libraries do not exist on the console.
++    Avahi Bluetooth CAP CEC DBus Iso9660pp LCMS2 LibUSB LircClient MDNS
++    MicroHttpd NFS Pipewire Plist PulseAudio SmbClient Sndio UDEV Udfread
++    XSLT)
++# Host /usr/local is not part of the PS4 target sysroot.
++set(SYSTEM_LDFLAGS "")
+diff --git a/cmake/scripts/common/ArchSetup.cmake b/cmake/scripts/common/ArchSetup.cmake
+index 0461496bf5..b8191d9fdb 100644
+--- a/cmake/scripts/common/ArchSetup.cmake
++++ b/cmake/scripts/common/ArchSetup.cmake
+@@ -156,15 +156,27 @@ if(NOT DEFINED NEON OR NEON)
+ endif()
+ 
+ if(NOT MSVC)
+-  # these options affect all code built by cmake including external projects.
+-  add_options(ALL_LANGUAGES ALL_BUILDS
+-    -Wall
+-    -Wdouble-promotion
+-    -Wmissing-field-initializers
+-    -Wsign-compare
+-    -Wextra
+-    -Wno-unused-parameter # from -Wextra
+-  )
++  if(CORE_PLATFORM_NAME STREQUAL "ps4")
++    # PS4 port: avoid -Werror on benign promotion/warnings while porting.
++    add_options(ALL_LANGUAGES ALL_BUILDS
++      -Wall
++      -Wno-double-promotion
++      -Wno-missing-field-initializers
++      -Wno-sign-compare
++      -Wextra
++      -Wno-unused-parameter
++    )
++  else()
++    # these options affect all code built by cmake including external projects.
++    add_options(ALL_LANGUAGES ALL_BUILDS
++      -Wall
++      -Wdouble-promotion
++      -Wmissing-field-initializers
++      -Wsign-compare
++      -Wextra
++      -Wno-unused-parameter # from -Wextra
++    )
++  endif()
+ 
+   add_options(CXX ALL_BUILDS
+     -Wnon-virtual-dtor
+@@ -177,11 +189,15 @@ if(NOT MSVC)
+ 
+   # these options affect only core code
+   if(NOT CORE_COMPILE_OPTIONS)
+-    set(CORE_COMPILE_OPTIONS
+-      -Werror=double-promotion
+-      -Werror=missing-field-initializers
+-      -Werror=sign-compare
+-    )
++    if(CORE_PLATFORM_NAME STREQUAL "ps4")
++      set(CORE_COMPILE_OPTIONS "")
++    else()
++      set(CORE_COMPILE_OPTIONS
++        -Werror=double-promotion
++        -Werror=missing-field-initializers
++        -Werror=sign-compare
++      )
++    endif()
+   endif()
+ endif()
+ 
+diff --git a/cmake/scripts/freebsd/ArchSetup.cmake b/cmake/scripts/freebsd/ArchSetup.cmake
+index 9e128df162..5be7e51e26 100644
+--- a/cmake/scripts/freebsd/ArchSetup.cmake
++++ b/cmake/scripts/freebsd/ArchSetup.cmake
+@@ -3,10 +3,18 @@ set(CORE_MAIN_SOURCE ${CMAKE_SOURCE_DIR}/xbmc/platform/posix/main.cpp)
+ 
+ set(ARCH_DEFINES -DTARGET_POSIX -DTARGET_FREEBSD)
+ set(SYSTEM_DEFINES -D__STDC_CONSTANT_MACROS -D_LARGEFILE64_SOURCE
+-                   -D_FILE_OFFSET_BITS=64 -DHAS_OSS)
++                   -D_FILE_OFFSET_BITS=64)
++# The OSS audio sink is not part of the PS4 build.
++if(NOT CORE_PLATFORM_NAME STREQUAL "ps4")
++  list(APPEND SYSTEM_DEFINES -DHAS_OSS)
++endif()
+ set(PLATFORM_DIR platform/linux)
+ set(PLATFORMDEFS_DIR platform/posix)
+-set(SYSTEM_LDFLAGS -L/usr/local/lib)
++if(NOT CORE_PLATFORM_NAME STREQUAL "ps4")
++  set(SYSTEM_LDFLAGS -L/usr/local/lib)
++else()
++  set(SYSTEM_LDFLAGS "")
++endif()
+ if(WITH_ARCH)
+   set(ARCH ${WITH_ARCH})
+ else()
+@@ -36,6 +44,12 @@ endif()
+ # Additional SYSTEM_DEFINES
+ list(APPEND SYSTEM_DEFINES -DHAS_POSIX_NETWORK -DHAS_FREEBSD_NETWORK)
+ 
++if(CORE_PLATFORM_NAME STREQUAL "ps4")
++  # The PS4 SDK ships libc++ 11, whose std::filesystem::path::u8string() still
++  # returns std::string, so nlohmann/json must not take its C++20 code path.
++  list(APPEND SYSTEM_DEFINES -DJSON_HAS_CPP_17=1 -DJSON_HAS_CPP_14=1 -DJSON_HAS_CPP_11=1)
++endif()
++
+ # Build internal libs
+ if(NOT USE_INTERNAL_LIBS)
+   if(KODI_DEPENDSBUILD)
+diff --git a/cmake/treedata/freebsd/ps4/subdirs.txt b/cmake/treedata/freebsd/ps4/subdirs.txt
+new file mode 100644
+index 0000000000..d82d7a4e62
+--- /dev/null
++++ b/cmake/treedata/freebsd/ps4/subdirs.txt
+@@ -0,0 +1,2 @@
++xbmc/windowing/ps4                 windowing/ps4
++xbmc/cores/RetroPlayer/shaders/gles cores/RetroPlayer/shaders/gles
+diff --git a/cmake/treedata/freebsd/subdirs.txt b/cmake/treedata/freebsd/subdirs.txt
+index 992578570d..09f9ced8db 100644
+--- a/cmake/treedata/freebsd/subdirs.txt
++++ b/cmake/treedata/freebsd/subdirs.txt
+@@ -2,8 +2,8 @@ xbmc/cores/RetroPlayer/shaders/gl   cores/RetroPlayer/shaders/gl
+ xbmc/input/touch                    input/touch
+ xbmc/input/touch/generic            input/touch/generic
+ xbmc/platform/common/speech         platform/common/speech
+-xbmc/platform/freebsd               platform/freebsd
+-xbmc/platform/freebsd/network       platform/freebsd/network
++xbmc/platform/ps4               platform/ps4
++xbmc/platform/ps4/network       platform/ps4/network
+ xbmc/platform/linux/input           platform/linux/input
+ xbmc/platform/linux/peripherals     platform/linux/peripherals
+ xbmc/platform/linux/powermanagement platform/linux/powermanagement
+diff --git a/lib/libUPnP/Neptune/Source/System/Bsd/NptBsdSockets.cpp b/lib/libUPnP/Neptune/Source/System/Bsd/NptBsdSockets.cpp
+index 5fe276fb26..08c30f6fad 100644
+--- a/lib/libUPnP/Neptune/Source/System/Bsd/NptBsdSockets.cpp
++++ b/lib/libUPnP/Neptune/Source/System/Bsd/NptBsdSockets.cpp
+@@ -1099,7 +1099,7 @@ NPT_BsdSocketInputStream::GetSize(NPT_LargeSize& size)
+     return NPT_ERROR_NOT_SUPPORTED;
+ }
+ 
+-#if defined(__PPU__)
++#if defined(__PPU__) || defined(__ORBIS__)
+ /*----------------------------------------------------------------------
+ |   NPT_BsdSocketInputStream::GetAvailable
+ +---------------------------------------------------------------------*/
+diff --git a/tools/depends/target/ffmpeg/009-ffmpeg-all-ps4-socket-cloexec-retry.patch b/tools/depends/target/ffmpeg/009-ffmpeg-all-ps4-socket-cloexec-retry.patch
+new file mode 100644
+index 0000000000..10a5a59a5b
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/009-ffmpeg-all-ps4-socket-cloexec-retry.patch
+@@ -0,0 +1,22 @@
++From: Kodi PS4 port
++Subject: [PATCH] libavformat: retry socket() without SOCK_CLOEXEC on EPROTONOSUPPORT
++
++The Orbis socket layer rejects SOCK_CLOEXEC (and SOCK_NONBLOCK) in the
++socket type with EPROTONOSUPPORT instead of EINVAL.  ff_socket() only
++retried without the flag on EINVAL, so every FFmpeg network open failed
++with "Protocol not supported" (HLS/HTTP/TCP could not connect).
++
++Retry without SOCK_CLOEXEC on EPROTONOSUPPORT as well.  The fcntl
++FD_CLOEXEC fallback below still applies, so the flag is not lost.
++---
++--- a/libavformat/network.c
+++++ b/libavformat/network.c
++@@ -186,7 +186,7 @@ int ff_socket(int af, int type, int proto, void *logctx)
++ 
++ #ifdef SOCK_CLOEXEC
++     fd = socket(af, type | SOCK_CLOEXEC, proto);
++-    if (fd == -1 && errno == EINVAL)
+++    if (fd == -1 && (errno == EINVAL || errno == EPROTONOSUPPORT))
++ #endif
++     {
++         fd = socket(af, type, proto);
+diff --git a/tools/depends/target/ffmpeg/010-ffmpeg-all-ps4-getaddrinfo-retry.patch b/tools/depends/target/ffmpeg/010-ffmpeg-all-ps4-getaddrinfo-retry.patch
+new file mode 100644
+index 0000000000..1b71ce1873
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/010-ffmpeg-all-ps4-getaddrinfo-retry.patch
+@@ -0,0 +1,36 @@
++From: Kodi PS4 port
++Subject: [PATCH] libavformat/tcp: retry getaddrinfo on EAI_AGAIN
++
++The PS4 resolver intermittently returns EAI_AGAIN ("Try again") when
++several add-on/logo threads resolve at once.  tcp_open() aborted the
++whole HLS/channel switch on the first failure:
++
++  [tcp] Failed to resolve hostname <live-host>: Try again
++  OpenDemuxStream - Error creating demuxer
++
++Retry a few times with a short backoff before giving up.
++---
++--- a/libavformat/tcp.c
+++++ b/libavformat/tcp.c
++@@ -183,9 +183,17 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
++     if (s->listen)
++         hints.ai_flags |= AI_PASSIVE;
++-    if (!hostname[0])
++-        ret = getaddrinfo(NULL, portstr, &hints, &ai);
++-    else
++-        ret = getaddrinfo(hostname, portstr, &hints, &ai);
+++    for (int attempt = 0; attempt < 3; attempt++) {
+++        if (!hostname[0])
+++            ret = getaddrinfo(NULL, portstr, &hints, &ai);
+++        else
+++            ret = getaddrinfo(hostname, portstr, &hints, &ai);
+++        if (ret == 0 || ret != EAI_AGAIN)
+++            break;
+++        av_log(h, AV_LOG_WARNING,
+++               "getaddrinfo(%s) returned EAI_AGAIN, retry %d/3\n",
+++               hostname, attempt + 1);
+++        av_usleep(100000 * (attempt + 1));
+++    }
++     if (ret) {
++         av_log(h, AV_LOG_ERROR,
++                "Failed to resolve hostname %s: %s\n",
+diff --git a/tools/depends/target/ffmpeg/011-ffmpeg-all-ps4-tcp-tuning.patch b/tools/depends/target/ffmpeg/011-ffmpeg-all-ps4-tcp-tuning.patch
+new file mode 100644
+index 0000000000..baa55cea86
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/011-ffmpeg-all-ps4-tcp-tuning.patch
+@@ -0,0 +1,52 @@
++From: Kodi PS4 port
++Subject: [PATCH] libavformat/tcp: automatic PS4 socket tuning
++
++Set streaming-friendly defaults for the PS4 network hardware: 256 KiB
++kernel send/receive buffers, TCP_NODELAY, keepalive with short probes and
++a 30 s read timeout so a dead peer cannot leave the player blocked.
++
++These defaults are overridable with the existing tcp_* AVOptions.
++---
++--- a/libavformat/tcp.c
+++++ b/libavformat/tcp.c
++@@ -58,12 +58,12 @@
++     { "listen",          "Listen for incoming connections",  OFFSET(listen),         AV_OPT_TYPE_INT, { .i64 = 0 },     0,       2,       .flags = D|E },
++     { "local_port",      "Local port",                                         OFFSET(local_port),     AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, .flags = D|E },
++     { "local_addr",      "Local address",                                      OFFSET(local_addr),     AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, .flags = D|E },
++-    { "timeout",     "set timeout (in microseconds) of socket I/O operations", OFFSET(rw_timeout),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+++    { "timeout",     "set timeout (in microseconds) of socket I/O operations", OFFSET(rw_timeout),     AV_OPT_TYPE_INT, { .i64 = 30000000 },    -1, INT_MAX, .flags = D|E },
++     { "listen_timeout",  "Connection awaiting timeout (in milliseconds)",      OFFSET(listen_timeout), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
++-    { "send_buffer_size", "Socket send buffer size (in bytes)",                OFFSET(send_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
++-    { "recv_buffer_size", "Socket receive buffer size (in bytes)",             OFFSET(recv_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
++-    { "tcp_nodelay", "Use TCP_NODELAY to disable nagle's algorithm",           OFFSET(tcp_nodelay), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
++-    { "tcp_keepalive", "Use TCP keepalive to detect dead connections and keep long-lived connections active.",           OFFSET(tcp_keepalive), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
+++    { "send_buffer_size", "Socket send buffer size (in bytes)",                OFFSET(send_buffer_size), AV_OPT_TYPE_INT, { .i64 = 262144 },     -1, INT_MAX, .flags = D|E },
+++    { "recv_buffer_size", "Socket receive buffer size (in bytes)",             OFFSET(recv_buffer_size), AV_OPT_TYPE_INT, { .i64 = 262144 },     -1, INT_MAX, .flags = D|E },
+++    { "tcp_nodelay", "Use TCP_NODELAY to disable nagle's algorithm",           OFFSET(tcp_nodelay), AV_OPT_TYPE_BOOL, { .i64 = 1 },             0, 1, .flags = D|E },
+++    { "tcp_keepalive", "Use TCP keepalive to detect dead connections and keep long-lived connections active.",           OFFSET(tcp_keepalive), AV_OPT_TYPE_BOOL, { .i64 = 1 },             0, 1, .flags = D|E },
++ #if !HAVE_WINSOCK2_H
++     { "tcp_mss",     "Maximum segment size for outgoing TCP packets",          OFFSET(tcp_mss),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
++ #endif /* !HAVE_WINSOCK2_H */
++@@ -134,6 +134,22 @@
++         }
++     }
++ 
+++#if defined(TCP_KEEPIDLE)
+++    /* PS4: SO_KEEPALIVE alone uses the kernel's 2-hour default.  Use short
+++     * probes so a dropped peer is detected while the player is waiting. */
+++    if (s->tcp_keepalive > 0) {
+++        int keepidle = 30;
+++        int keepintvl = 10;
+++        int keepcnt = 3;
+++        if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle)))
+++            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_KEEPIDLE)");
+++        if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl)))
+++            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_KEEPINTVL)");
+++        if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt)))
+++            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_KEEPCNT)");
+++    }
+++#endif
+++
++ #if !HAVE_WINSOCK2_H
++     if (s->tcp_mss > 0) {
++         if (setsockopt (fd, IPPROTO_TCP, TCP_MAXSEG, &s->tcp_mss, sizeof (s->tcp_mss))) {
+diff --git a/tools/depends/target/ffmpeg/012-ffmpeg-all-ps4-dns-retry-ipv4.patch b/tools/depends/target/ffmpeg/012-ffmpeg-all-ps4-dns-retry-ipv4.patch
+new file mode 100644
+index 0000000000..c2cb01e9f5
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/012-ffmpeg-all-ps4-dns-retry-ipv4.patch
+@@ -0,0 +1,68 @@
++From: Kodi PS4 port
++Subject: [PATCH] libavformat/tcp: retry transient DNS errors and fall back to IPv4
++
++The PS4 Wi-Fi resolver returns EAI_SYSTEM/EAI_FAIL while the link is
++settling.  Retry transient errors with IPv4 first and use AF_UNSPEC only
++as a fallback, so a missing IPv6 route does not delay HLS/channel open.
++---
++--- a/libavformat/tcp.c
+++++ b/libavformat/tcp.c
++@@ -77,6 +77,17 @@
++     .version    = LIBAVUTIL_VERSION_INT,
++ };
++ 
+++static int is_transient_dns_error(int ret)
+++{
+++    if (ret == EAI_AGAIN || ret == EAI_FAIL)
+++        return 1;
+++#ifdef EAI_SYSTEM
+++    if (ret == EAI_SYSTEM)
+++        return 1;
+++#endif
+++    return 0;
+++}
+++
++ static int customize_fd(void *ctx, int fd, int family)
++ {
++     TCPContext *s = ctx;
++@@ -175,22 +186,29 @@
++         s->open_timeout =
++         h->rw_timeout   = s->rw_timeout;
++     }
++-    hints.ai_family = AF_UNSPEC;
++     hints.ai_socktype = SOCK_STREAM;
++     snprintf(portstr, sizeof(portstr), "%d", port);
++     if (s->listen)
++         hints.ai_flags |= AI_PASSIVE;
++-    for (int attempt = 0; attempt < 3; attempt++) {
++-        if (!hostname[0])
++-            ret = getaddrinfo(NULL, portstr, &hints, &ai);
++-        else
++-            ret = getaddrinfo(hostname, portstr, &hints, &ai);
++-        if (ret == 0 || ret != EAI_AGAIN)
+++
+++    /* PS4: retry transient resolver failures with IPv4 first.  The console
+++     * has no usable IPv6 route, so AF_UNSPEC is only a fallback. */
+++    for (int pass = 0; pass < 2; pass++) {
+++        hints.ai_family = pass == 0 ? AF_INET : AF_UNSPEC;
+++        for (int attempt = 0; attempt < 3; attempt++) {
+++            if (!hostname[0])
+++                ret = getaddrinfo(NULL, portstr, &hints, &ai);
+++            else
+++                ret = getaddrinfo(hostname, portstr, &hints, &ai);
+++            if (ret == 0 || !is_transient_dns_error(ret))
+++                break;
+++            av_log(h, AV_LOG_WARNING,
+++                   "getaddrinfo(%s) returned %s, retry %d/3 (family %d)\n",
+++                   hostname, gai_strerror(ret), attempt + 1, hints.ai_family);
+++            av_usleep(100000 * (attempt + 1));
+++        }
+++        if (ret == 0 || !is_transient_dns_error(ret))
++             break;
++-        av_log(h, AV_LOG_WARNING,
++-               "getaddrinfo(%s) returned EAI_AGAIN, retry %d/3\n",
++-               hostname, attempt + 1);
++-        av_usleep(100000 * (attempt + 1));
++     }
++     if (ret) {
++         av_log(h, AV_LOG_ERROR,
+diff --git a/tools/depends/target/ffmpeg/014-ffmpeg-all-ps4-tls-groups.patch b/tools/depends/target/ffmpeg/014-ffmpeg-all-ps4-tls-groups.patch
+new file mode 100644
+index 0000000000..96184740c5
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/014-ffmpeg-all-ps4-tls-groups.patch
+@@ -0,0 +1,26 @@
++From: Kodi PS4 port
++Subject: [PATCH] libavformat/tls_openssl: prefer classic TLS groups on PS4
++
++OpenSSL 3.5 sends X25519MLKEM768 by default.  The post-quantum key share
++makes the Client Hello ~1.5 KiB; the lossy 2.4 GHz link drops that packet
++and TCP retransmits after ~5 s on every new HTTPS connection.  Prefer
++X25519/P-256 so the hello fits in one segment.
++---
++--- a/libavformat/tls_openssl.c
+++++ b/libavformat/tls_openssl.c
++@@ -802,6 +802,15 @@
++         ret = AVERROR(EIO);
++         goto fail;
++     }
+++#if defined(SSL_CTX_set1_groups_list)
+++    /* PS4: OpenSSL 3.5 offers X25519MLKEM768 by default; the ~1.2 KiB
+++     * post-quantum key share makes the Client Hello ~1.5 KiB, which the
+++     * lossy 2.4 GHz link drops.  TCP retransmits after ~5 s on every new
+++     * HTTPS connection.  Prefer classic groups so the hello fits in one
+++     * segment; both are supported by every current CDN. */
+++    if (!s->is_dtls && !SSL_CTX_set1_groups_list(c->ctx, "X25519:P-256"))
+++        av_log(h, AV_LOG_DEBUG, "Failed to set TLS groups: %s\n", openssl_get_error(c));
+++#endif
++     if (!s->is_dtls) {
++         if (!SSL_CTX_set_min_proto_version(c->ctx, TLS1_VERSION)) {
++             av_log(h, AV_LOG_ERROR, "Failed to set minimum TLS version to TLSv1\n");
+diff --git a/tools/depends/target/ffmpeg/CMakeLists.txt b/tools/depends/target/ffmpeg/CMakeLists.txt
+index 24bc718dbf..52fed894fc 100644
+--- a/tools/depends/target/ffmpeg/CMakeLists.txt
++++ b/tools/depends/target/ffmpeg/CMakeLists.txt
+@@ -14,8 +14,18 @@ endif()
+ 
+ set(env_vars ${EXTRA_ENV_VARS})
+ 
++if(CORE_PLATFORM_NAME STREQUAL "ps4")
++  # The port's configure script passes the target dependency prefix.
++  if(DEPS_PS4)
++    set(PS4_DEPS_PATH "${DEPS_PS4}")
++  else()
++    set(PS4_DEPS_PATH "${DEPENDS_PATH}")
++  endif()
++endif()
++
+ if(CROSSCOMPILING)
+-  list(APPEND env_vars "PKG_CONFIG_LIBDIR=${DEPENDS_PATH}/lib/pkgconfig")
++  # PS4: the target dependencies are installed outside DEPENDS_PATH.
++  list(APPEND env_vars "PKG_CONFIG_LIBDIR=${DEPENDS_PATH}/lib/pkgconfig:${PS4_DEPS_PATH}/lib/pkgconfig")
+   list(APPEND ffmpeg_conf --pkg-config=${PKG_CONFIG_EXECUTABLE}
+                           --pkg-config-flags=--static
+                           --enable-cross-compile
+@@ -41,14 +51,19 @@ list(APPEND ffmpeg_conf --disable-doc
+                         --disable-vulkan
+                         --enable-gpl
+                         --enable-version3
+-                        --enable-openssl
+                         --enable-runtime-cpudetect
+                         --enable-pthreads
+                         --extra-version="Kodi"
+             )
+ 
++list(APPEND ffmpeg_conf --enable-openssl)
++
+ if(CMAKE_C_FLAGS)
+-  list(APPEND ffmpeg_conf --extra-cflags=${CMAKE_C_FLAGS})
++  if(CORE_PLATFORM_NAME STREQUAL "ps4")
++    list(APPEND ffmpeg_conf "--extra-cflags=${CMAKE_C_FLAGS} -I${PS4_DEPS_PATH}/include")
++  else()
++    list(APPEND ffmpeg_conf "--extra-cflags=${CMAKE_C_FLAGS}")
++  endif()
+ endif()
+ 
+ if(CMAKE_CXX_FLAGS)
+@@ -56,7 +71,13 @@ if(CMAKE_CXX_FLAGS)
+ endif()
+ 
+ if(CMAKE_EXE_LINKER_FLAGS)
+-  list(APPEND ffmpeg_conf --extra-ldflags=${CMAKE_EXE_LINKER_FLAGS})
++  if(CORE_PLATFORM_NAME STREQUAL "ps4")
++    # OpenSSL's resolvconf pulls sceNetGetDnsInfo from libc.a; the FFmpeg
++    # configure link tests need the SceNet stubs too.
++    list(APPEND ffmpeg_conf "--extra-ldflags=${CMAKE_EXE_LINKER_FLAGS} -L${PS4_DEPS_PATH}/lib -lSceNet -lSceNetCtl")
++  else()
++    list(APPEND ffmpeg_conf "--extra-ldflags=${CMAKE_EXE_LINKER_FLAGS}")
++  endif()
+ endif()
+ 
+ if(ENABLE_NEON)
+@@ -160,6 +181,11 @@ else()
+   set(sourceplugin_patch PATCH_COMMAND patch -p1 -i <SOURCE_DIR>/002-ffmpeg-libavutil-common-h-cpp11-constant-macros.patch)
+ endif()
+ list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch)
++list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/009-ffmpeg-all-ps4-socket-cloexec-retry.patch)
++list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/010-ffmpeg-all-ps4-getaddrinfo-retry.patch)
++list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/011-ffmpeg-all-ps4-tcp-tuning.patch)
++list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/012-ffmpeg-all-ps4-dns-retry-ipv4.patch)
++list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/014-ffmpeg-all-ps4-tls-groups.patch)
+ 
+ include(ExternalProject)
+ externalproject_add(ffmpeg
+diff --git a/xbmc/interfaces/generic/ScriptInvocationManager.cpp b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+index 952f379b0e..891d908c6f 100644
+--- a/xbmc/interfaces/generic/ScriptInvocationManager.cpp
++++ b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+@@ -53,7 +53,7 @@ void CScriptInvocationManager::Process()
+   lock.unlock();
+ 
+   // let the invocation handlers do their processing
+-  std::ranges::for_each(m_invocationHandlers, [](auto& handler) { handler.second->Process(); });
++  for (auto& handler : m_invocationHandlers) handler.second->Process();
+ }
+ 
+ void CScriptInvocationManager::Uninitialize()
+@@ -68,8 +68,7 @@ void CScriptInvocationManager::Uninitialize()
+ 
+   // make sure all scripts are done
+   std::vector<LanguageInvokerThread> tempList;
+-  std::ranges::transform(m_scripts, std::back_inserter(tempList),
+-                         [](const auto& script) { return script.second; });
++  for (const auto& script : m_scripts) tempList.push_back(script.second);
+ 
+   m_scripts.clear();
+   m_scriptPaths.clear();
+@@ -80,20 +79,18 @@ void CScriptInvocationManager::Uninitialize()
+   // finally stop and remove the finished threads but we do it outside of any
+   // locks in case of any callbacks from the stop or destruction logic of
+   // CLanguageInvokerThread or the ILanguageInvoker implementation
+-  std::ranges::for_each(tempList,
+-                        [](auto& val)
+-                        {
+-                          if (!val.done)
+-                            val.thread->Stop(true);
+-                        });
++  for (auto& val : tempList)
++  {
++    if (!val.done)
++      val.thread->Stop(true);
++  }
+ 
+   lock.lock();
+ 
+   tempList.clear();
+ 
+   // uninitialize all invocation handlers and then remove them
+-  std::ranges::for_each(m_invocationHandlers,
+-                        [](auto& handler) { handler.second->Uninitialize(); });
++  for (auto& handler : m_invocationHandlers) handler.second->Uninitialize();
+ 
+   m_invocationHandlers.clear();
+ }
+@@ -111,9 +108,9 @@ void CScriptInvocationManager::RegisterLanguageInvocationHandler(
+ 
+   std::unique_lock lock(m_critSection);
+ 
+-  const bool known =
+-      std::ranges::any_of(m_invocationHandlers, [invocationHandler](const auto& handler)
+-                          { return handler.second == invocationHandler; });
++  bool known = false;
++  for (const auto& handler : m_invocationHandlers)
++    if (handler.second == invocationHandler) { known = true; break; }
+ 
+   bool inserted;
+   std::tie(std::ignore, inserted) = m_invocationHandlers.emplace(ext, invocationHandler);
+@@ -129,8 +126,8 @@ void CScriptInvocationManager::RegisterLanguageInvocationHandler(
+   if (invocationHandler == nullptr || extensions.empty())
+     return;
+ 
+-  std::ranges::for_each(extensions, [&invocationHandler, this](const auto& extension)
+-                        { RegisterLanguageInvocationHandler(invocationHandler, extension); });
++  for (const auto& extension : extensions)
++    RegisterLanguageInvocationHandler(invocationHandler, extension);
+ }
+ 
+ void CScriptInvocationManager::UnregisterLanguageInvocationHandler(ILanguageInvocationHandler *invocationHandler)
+@@ -341,12 +338,11 @@ bool CScriptInvocationManager::Stop(int scriptId, bool wait /* = false */)
+ 
+ void CScriptInvocationManager::StopRunningScripts(bool wait /* = false */)
+ {
+-  std::ranges::for_each(m_scripts,
+-                        [wait, this](auto& script)
+-                        {
+-                          if (!script.second.done)
+-                            Stop(script.second.script, wait);
+-                        });
++  for (auto& script : m_scripts)
++  {
++    if (!script.second.done)
++      Stop(script.second.script, wait);
++  }
+ }
+ 
+ void CScriptInvocationManager::NotifyAllScriptsAborting()
+diff --git a/xbmc/pvr/addons/PVRClient.cpp b/xbmc/pvr/addons/PVRClient.cpp
+index 64254c5d40..23c5d3e6b0 100644
+--- a/xbmc/pvr/addons/PVRClient.cpp
++++ b/xbmc/pvr/addons/PVRClient.cpp
+@@ -53,7 +53,7 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
+-#include <source_location>
++#define KODI_SOURCE_FUNCTION __FUNCTION__
+ #include <string>
+ #include <type_traits>
+ #include <utility>
+@@ -675,7 +675,7 @@ bool CPVRClient::GetAddonProperties()
+ 
+   /* get the capabilities */
+   PVR_ERROR retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&addonCapabilities](const AddonInstance* addon)
+       { return addon->toAddon->GetCapabilities(addon, &addonCapabilities); }, true, false);
+ 
+@@ -687,7 +687,7 @@ bool CPVRClient::GetAddonProperties()
+ 
+   /* free the resources of the capabilities instance */
+   DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&addonCapabilities](const AddonInstance* addon)
+       { return addon->toAddon->FreeCapabilities(addon, &addonCapabilities); }, true, false);
+ 
+@@ -703,7 +703,7 @@ bool CPVRClient::GetAddonNameStringProperties()
+ 
+   /* get the name of the backend */
+   PVR_ERROR retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&backendName](const AddonInstance* addon)
+       {
+         char* strBackendName{nullptr};
+@@ -720,7 +720,7 @@ bool CPVRClient::GetAddonNameStringProperties()
+ 
+   /* get the connection string */
+   retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&connectionString](const AddonInstance* addon)
+       {
+         char* strConnectionString{nullptr};
+@@ -737,7 +737,7 @@ bool CPVRClient::GetAddonNameStringProperties()
+ 
+   /* backend version number */
+   retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&backendVersion](const AddonInstance* addon)
+       {
+         char* strBackendVersion{nullptr};
+@@ -754,7 +754,7 @@ bool CPVRClient::GetAddonNameStringProperties()
+ 
+   /* backend hostname */
+   retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&backendHostname](const AddonInstance* addon)
+       {
+         char* strBackendHostname{nullptr};
+@@ -863,7 +863,7 @@ PVR_ERROR CPVRClient::GetDriveSpace(uint64_t& iTotal, uint64_t& iUsed) const
+   iTotal = 0;
+   iUsed = 0;
+ 
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&iTotal, &iUsed](const AddonInstance* addon)
+                      {
+                        uint64_t iTotalSpace = 0;
+@@ -882,7 +882,7 @@ PVR_ERROR CPVRClient::GetDriveSpace(uint64_t& iTotal, uint64_t& iUsed) const
+ PVR_ERROR CPVRClient::StartChannelScan()
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [](const AddonInstance* addon) { return addon->toAddon->OpenDialogChannelScan(addon); },
+       m_clientCapabilities.SupportsChannelScan());
+ }
+@@ -890,7 +890,7 @@ PVR_ERROR CPVRClient::StartChannelScan()
+ PVR_ERROR CPVRClient::OpenDialogChannelAdd(const std::shared_ptr<const CPVRChannel>& channel)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [channel](const AddonInstance* addon)
+       {
+         const CAddonChannel addonChannel{*channel};
+@@ -902,7 +902,7 @@ PVR_ERROR CPVRClient::OpenDialogChannelAdd(const std::shared_ptr<const CPVRChann
+ PVR_ERROR CPVRClient::OpenDialogChannelSettings(const std::shared_ptr<const CPVRChannel>& channel)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [channel](const AddonInstance* addon)
+       {
+         const CAddonChannel addonChannel{*channel};
+@@ -914,7 +914,7 @@ PVR_ERROR CPVRClient::OpenDialogChannelSettings(const std::shared_ptr<const CPVR
+ PVR_ERROR CPVRClient::DeleteChannel(const std::shared_ptr<const CPVRChannel>& channel)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [channel](const AddonInstance* addon)
+       {
+         const CAddonChannel addonChannel{*channel};
+@@ -926,7 +926,7 @@ PVR_ERROR CPVRClient::DeleteChannel(const std::shared_ptr<const CPVRChannel>& ch
+ PVR_ERROR CPVRClient::RenameChannel(const std::shared_ptr<const CPVRChannel>& channel)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [channel](const AddonInstance* addon)
+       {
+         const CAddonChannel addonChannel{*channel, channel->ChannelName()};
+@@ -941,7 +941,7 @@ PVR_ERROR CPVRClient::GetEPGForChannel(int iChannelUid,
+                                        time_t end) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, iChannelUid, epg, start, end](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -961,7 +961,7 @@ PVR_ERROR CPVRClient::GetEPGForChannel(int iChannelUid,
+ PVR_ERROR CPVRClient::SetEPGMaxPastDays(int iPastDays)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [iPastDays](const AddonInstance* addon)
++      __FUNCTION__, [iPastDays](const AddonInstance* addon)
+       { return addon->toAddon->SetEPGMaxPastDays(addon, iPastDays); },
+       m_clientCapabilities.SupportsEPG());
+ }
+@@ -969,7 +969,7 @@ PVR_ERROR CPVRClient::SetEPGMaxPastDays(int iPastDays)
+ PVR_ERROR CPVRClient::SetEPGMaxFutureDays(int iFutureDays)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [iFutureDays](const AddonInstance* addon)
++      __FUNCTION__, [iFutureDays](const AddonInstance* addon)
+       { return addon->toAddon->SetEPGMaxFutureDays(addon, iFutureDays); },
+       m_clientCapabilities.SupportsEPG());
+ }
+@@ -978,7 +978,7 @@ PVR_ERROR CPVRClient::IsRecordable(const std::shared_ptr<const CPVREpgInfoTag>&
+                                    bool& bIsRecordable) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [tag, &bIsRecordable](const AddonInstance* addon)
+       {
+         CAddonEpgTag addonTag(*tag);
+@@ -991,7 +991,7 @@ PVR_ERROR CPVRClient::IsPlayable(const std::shared_ptr<const CPVREpgInfoTag>& ta
+                                  bool& bIsPlayable) const
+ {
+   const PVR_ERROR error{DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [tag, &bIsPlayable](const AddonInstance* addon)
+       {
+         CAddonEpgTag addonTag(*tag);
+@@ -1021,7 +1021,7 @@ void CPVRClient::WriteStreamProperties(std::span<PVR_NAMED_VALUE*> properties,
+ PVR_ERROR CPVRClient::GetEpgTagStreamProperties(const std::shared_ptr<const CPVREpgInfoTag>& tag,
+                                                 CPVRStreamProperties& props) const
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&tag, &props](const AddonInstance* addon)
+                      {
+                        CAddonEpgTag addonTag(*tag);
+@@ -1043,7 +1043,7 @@ PVR_ERROR CPVRClient::GetEpgTagEdl(const std::shared_ptr<const CPVREpgInfoTag>&
+ {
+   edls.clear();
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&epgTag, &edls](const AddonInstance* addon)
+       {
+         CAddonEpgTag addonTag(*epgTag);
+@@ -1067,7 +1067,7 @@ PVR_ERROR CPVRClient::GetChannelGroupsAmount(int& iGroups) const
+ {
+   iGroups = -1;
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [&iGroups](const AddonInstance* addon)
++      __FUNCTION__, [&iGroups](const AddonInstance* addon)
+       { return addon->toAddon->GetChannelGroupsAmount(addon, &iGroups); },
+       m_clientCapabilities.SupportsChannelGroups());
+ }
+@@ -1076,7 +1076,7 @@ PVR_ERROR CPVRClient::GetChannelGroups(CPVRChannelGroups* groups) const
+ {
+   const bool radio{groups->IsRadio()};
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, groups](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1095,7 +1095,7 @@ PVR_ERROR CPVRClient::GetChannelGroupMembers(
+ {
+   const bool radio{group.IsRadio()};
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, &group, &groupMembers](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1113,7 +1113,7 @@ PVR_ERROR CPVRClient::GetChannelGroupMembers(
+ PVR_ERROR CPVRClient::GetProvidersAmount(int& iProviders) const
+ {
+   iProviders = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&iProviders](const AddonInstance* addon)
+                      { return addon->toAddon->GetProvidersAmount(addon, &iProviders); });
+ }
+@@ -1121,7 +1121,7 @@ PVR_ERROR CPVRClient::GetProvidersAmount(int& iProviders) const
+ PVR_ERROR CPVRClient::GetProviders(CPVRProvidersContainer& providers) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, &providers](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1135,7 +1135,7 @@ PVR_ERROR CPVRClient::GetProviders(CPVRProvidersContainer& providers) const
+ PVR_ERROR CPVRClient::GetChannelsAmount(int& iChannels) const
+ {
+   iChannels = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&iChannels](const AddonInstance* addon)
+                      { return addon->toAddon->GetChannelsAmount(addon, &iChannels); });
+ }
+@@ -1143,7 +1143,7 @@ PVR_ERROR CPVRClient::GetChannelsAmount(int& iChannels) const
+ PVR_ERROR CPVRClient::GetChannels(bool radio, std::vector<std::shared_ptr<CPVRChannel>>& channels)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, radio, &channels](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1171,7 +1171,7 @@ PVR_ERROR CPVRClient::GetRecordingsAmount(bool deleted, int& iRecordings) const
+ {
+   iRecordings = -1;
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [deleted, &iRecordings](const AddonInstance* addon)
+       { return addon->toAddon->GetRecordingsAmount(addon, deleted, &iRecordings); },
+       m_clientCapabilities.SupportsRecordings() &&
+@@ -1181,7 +1181,7 @@ PVR_ERROR CPVRClient::GetRecordingsAmount(bool deleted, int& iRecordings) const
+ PVR_ERROR CPVRClient::GetRecordings(CPVRRecordings* results, bool deleted) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, results, deleted](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1196,7 +1196,7 @@ PVR_ERROR CPVRClient::GetRecordings(CPVRRecordings* results, bool deleted) const
+ PVR_ERROR CPVRClient::DeleteRecording(const CPVRRecording& recording)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1208,7 +1208,7 @@ PVR_ERROR CPVRClient::DeleteRecording(const CPVRRecording& recording)
+ PVR_ERROR CPVRClient::UndeleteRecording(const CPVRRecording& recording)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1220,7 +1220,7 @@ PVR_ERROR CPVRClient::UndeleteRecording(const CPVRRecording& recording)
+ PVR_ERROR CPVRClient::DeleteAllRecordingsFromTrash()
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [](const AddonInstance* addon)
++      __FUNCTION__, [](const AddonInstance* addon)
+       { return addon->toAddon->DeleteAllRecordingsFromTrash(addon); },
+       m_clientCapabilities.SupportsRecordingsUndelete());
+ }
+@@ -1228,7 +1228,7 @@ PVR_ERROR CPVRClient::DeleteAllRecordingsFromTrash()
+ PVR_ERROR CPVRClient::RenameRecording(const CPVRRecording& recording)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1240,7 +1240,7 @@ PVR_ERROR CPVRClient::RenameRecording(const CPVRRecording& recording)
+ PVR_ERROR CPVRClient::SetRecordingLifetime(const CPVRRecording& recording)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1252,7 +1252,7 @@ PVR_ERROR CPVRClient::SetRecordingLifetime(const CPVRRecording& recording)
+ PVR_ERROR CPVRClient::SetRecordingPlayCount(const CPVRRecording& recording, int count)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording, count](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1265,7 +1265,7 @@ PVR_ERROR CPVRClient::SetRecordingLastPlayedPosition(const CPVRRecording& record
+                                                      int lastplayedposition)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording, lastplayedposition](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1279,7 +1279,7 @@ PVR_ERROR CPVRClient::GetRecordingLastPlayedPosition(const CPVRRecording& record
+ {
+   iPosition = -1;
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording, &iPosition](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1293,7 +1293,7 @@ PVR_ERROR CPVRClient::GetRecordingEdl(const CPVRRecording& recording,
+ {
+   edls.clear();
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording, &edls](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1316,7 +1316,7 @@ PVR_ERROR CPVRClient::GetRecordingEdl(const CPVRRecording& recording,
+ PVR_ERROR CPVRClient::GetRecordingSize(const CPVRRecording& recording, int64_t& sizeInBytes) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&recording, &sizeInBytes](const AddonInstance* addon)
+       {
+         const CAddonRecording tag{recording};
+@@ -1329,7 +1329,7 @@ PVR_ERROR CPVRClient::GetTimersAmount(int& iTimers) const
+ {
+   iTimers = -1;
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [&iTimers](const AddonInstance* addon)
++      __FUNCTION__, [&iTimers](const AddonInstance* addon)
+       { return addon->toAddon->GetTimersAmount(addon, &iTimers); },
+       m_clientCapabilities.SupportsTimers());
+ }
+@@ -1337,7 +1337,7 @@ PVR_ERROR CPVRClient::GetTimersAmount(int& iTimers) const
+ PVR_ERROR CPVRClient::GetTimers(CPVRTimersContainer* results) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, results](const AddonInstance* addon)
+       {
+         PVR_HANDLE_STRUCT handle = {};
+@@ -1351,7 +1351,7 @@ PVR_ERROR CPVRClient::GetTimers(CPVRTimersContainer* results) const
+ PVR_ERROR CPVRClient::AddTimer(const CPVRTimerInfoTag& timer)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&timer](const AddonInstance* addon)
+       {
+         const CAddonTimer tag{timer};
+@@ -1363,7 +1363,7 @@ PVR_ERROR CPVRClient::AddTimer(const CPVRTimerInfoTag& timer)
+ PVR_ERROR CPVRClient::DeleteTimer(const CPVRTimerInfoTag& timer, bool bForce /* = false */)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&timer, bForce](const AddonInstance* addon)
+       {
+         const CAddonTimer tag{timer};
+@@ -1375,7 +1375,7 @@ PVR_ERROR CPVRClient::DeleteTimer(const CPVRTimerInfoTag& timer, bool bForce /*
+ PVR_ERROR CPVRClient::UpdateTimer(const CPVRTimerInfoTag& timer)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&timer](const AddonInstance* addon)
+       {
+         const CAddonTimer tag{timer};
+@@ -1479,7 +1479,7 @@ PVR_ERROR CPVRClient::UpdateTimerTypes()
+   std::vector<std::shared_ptr<CPVRTimerType>> timerTypes;
+ 
+   PVR_ERROR retVal = DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, &timerTypes](const AddonInstance* addon) { return GetTimerTypes(addon, timerTypes); },
+       m_clientCapabilities.SupportsTimers(), false);
+ 
+@@ -1514,7 +1514,7 @@ PVR_ERROR CPVRClient::UpdateTimerTypes()
+ PVR_ERROR CPVRClient::GetStreamReadChunkSize(int& iChunkSize) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(), [&iChunkSize](const AddonInstance* addon)
++      __FUNCTION__, [&iChunkSize](const AddonInstance* addon)
+       { return addon->toAddon->GetStreamReadChunkSize(addon, &iChunkSize); },
+       m_clientCapabilities.SupportsRecordings() || m_clientCapabilities.HandlesInputStream());
+ }
+@@ -1522,7 +1522,7 @@ PVR_ERROR CPVRClient::GetStreamReadChunkSize(int& iChunkSize) const
+ PVR_ERROR CPVRClient::ReadLiveStream(uint8_t* lpBuf, int64_t uiBufSize, int& iRead)
+ {
+   iRead = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&lpBuf, uiBufSize, &iRead](const AddonInstance* addon)
+                      {
+                        iRead = addon->toAddon->ReadLiveStream(addon, lpBuf,
+@@ -1537,7 +1537,7 @@ PVR_ERROR CPVRClient::ReadRecordedStream(int64_t streamId,
+                                          int& iRead)
+ {
+   iRead = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [streamId, &lpBuf, uiBufSize, &iRead](const AddonInstance* addon)
+                      {
+                        iRead = addon->toAddon->ReadRecordedStream(addon, streamId, lpBuf,
+@@ -1549,7 +1549,7 @@ PVR_ERROR CPVRClient::ReadRecordedStream(int64_t streamId,
+ PVR_ERROR CPVRClient::SeekLiveStream(int64_t iFilePosition, int iWhence, int64_t& iPosition)
+ {
+   iPosition = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [iFilePosition, iWhence, &iPosition](const AddonInstance* addon)
+                      {
+                        iPosition = addon->toAddon->SeekLiveStream(addon, iFilePosition, iWhence);
+@@ -1563,7 +1563,7 @@ PVR_ERROR CPVRClient::SeekRecordedStream(int64_t streamId,
+                                          int64_t& iPosition)
+ {
+   iPosition = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [streamId, iFilePosition, iWhence, &iPosition](const AddonInstance* addon)
+                      {
+                        iPosition = addon->toAddon->SeekRecordedStream(addon, streamId,
+@@ -1574,7 +1574,7 @@ PVR_ERROR CPVRClient::SeekRecordedStream(int64_t streamId,
+ 
+ PVR_ERROR CPVRClient::SeekTime(double time, bool backwards, double* startpts)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [time, backwards, &startpts](const AddonInstance* addon)
+                      {
+                        return addon->toAddon->SeekTime(addon, time, backwards, startpts)
+@@ -1586,7 +1586,7 @@ PVR_ERROR CPVRClient::SeekTime(double time, bool backwards, double* startpts)
+ PVR_ERROR CPVRClient::GetLiveStreamLength(int64_t& iLength) const
+ {
+   iLength = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&iLength](const AddonInstance* addon)
+                      {
+                        iLength = addon->toAddon->LengthLiveStream(addon);
+@@ -1597,7 +1597,7 @@ PVR_ERROR CPVRClient::GetLiveStreamLength(int64_t& iLength) const
+ PVR_ERROR CPVRClient::GetRecordedStreamLength(int64_t streamId, int64_t& iLength) const
+ {
+   iLength = -1;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [streamId, &iLength](const AddonInstance* addon)
+                      {
+                        iLength = addon->toAddon->LengthRecordedStream(addon, streamId);
+@@ -1607,7 +1607,7 @@ PVR_ERROR CPVRClient::GetRecordedStreamLength(int64_t streamId, int64_t& iLength
+ 
+ PVR_ERROR CPVRClient::SignalQuality(int channelUid, CPVRSignalStatus& qualityinfo) const
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [channelUid, &qualityinfo](const AddonInstance* addon)
+                      {
+                        PVR_SIGNAL_STATUS info{};
+@@ -1624,7 +1624,7 @@ PVR_ERROR CPVRClient::SignalQuality(int channelUid, CPVRSignalStatus& qualityinf
+ PVR_ERROR CPVRClient::GetDescrambleInfo(int channelUid, CPVRDescrambleInfo& descrambleinfo) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [channelUid, &descrambleinfo](const AddonInstance* addon)
+       {
+         PVR_DESCRAMBLE_INFO info{};
+@@ -1643,7 +1643,7 @@ PVR_ERROR CPVRClient::GetChannelStreamProperties(const std::shared_ptr<const CPV
+                                                  CPVRStreamProperties& props) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, &channel, source, &props](const AddonInstance* addon)
+       {
+         if (!CanPlayChannel(channel))
+@@ -1667,7 +1667,7 @@ PVR_ERROR CPVRClient::GetRecordingStreamProperties(
+     const std::shared_ptr<const CPVRRecording>& recording, CPVRStreamProperties& props) const
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, &recording, &props](const AddonInstance* addon)
+       {
+         if (!m_clientCapabilities.SupportsRecordings())
+@@ -1689,21 +1689,21 @@ PVR_ERROR CPVRClient::GetRecordingStreamProperties(
+ 
+ PVR_ERROR CPVRClient::GetStreamProperties(PVR_STREAM_PROPERTIES* props) const
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&props](const AddonInstance* addon)
+                      { return addon->toAddon->GetStreamProperties(addon, props); });
+ }
+ 
+ PVR_ERROR CPVRClient::StreamClosed() const
+ {
+-  return DoAddonCall(std::source_location::current().function_name(), [](const AddonInstance* addon)
++  return DoAddonCall(__FUNCTION__, [](const AddonInstance* addon)
+                      { return addon->toAddon->StreamClosed(addon); });
+ }
+ 
+ PVR_ERROR CPVRClient::DemuxReset()
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [](const AddonInstance* addon)
+       {
+         addon->toAddon->DemuxReset(addon);
+@@ -1715,7 +1715,7 @@ PVR_ERROR CPVRClient::DemuxReset()
+ PVR_ERROR CPVRClient::DemuxAbort()
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [](const AddonInstance* addon)
+       {
+         addon->toAddon->DemuxAbort(addon);
+@@ -1727,7 +1727,7 @@ PVR_ERROR CPVRClient::DemuxAbort()
+ PVR_ERROR CPVRClient::DemuxFlush()
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [](const AddonInstance* addon)
+       {
+         addon->toAddon->DemuxFlush(addon);
+@@ -1739,7 +1739,7 @@ PVR_ERROR CPVRClient::DemuxFlush()
+ PVR_ERROR CPVRClient::DemuxRead(DemuxPacket*& packet)
+ {
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [&packet](const AddonInstance* addon)
+       {
+         packet = static_cast<DemuxPacket*>(addon->toAddon->DemuxRead(addon));
+@@ -1841,7 +1841,7 @@ PVR_ERROR CPVRClient::OpenLiveStream(const std::shared_ptr<const CPVRChannel>& c
+   if (!channel)
+     return PVR_ERROR_INVALID_PARAMETERS;
+ 
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [this, channel](const AddonInstance* addon)
+                      {
+                        CloseLiveStream();
+@@ -1871,7 +1871,7 @@ PVR_ERROR CPVRClient::OpenRecordedStream(const std::shared_ptr<const CPVRRecordi
+     return PVR_ERROR_INVALID_PARAMETERS;
+ 
+   return DoAddonCall(
+-      std::source_location::current().function_name(),
++      __FUNCTION__,
+       [this, recording, &streamId](const AddonInstance* addon)
+       {
+         if (!m_clientCapabilities.SupportsMultipleRecordedStreams())
+@@ -1888,7 +1888,7 @@ PVR_ERROR CPVRClient::OpenRecordedStream(const std::shared_ptr<const CPVRRecordi
+ 
+ PVR_ERROR CPVRClient::CloseLiveStream()
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [](const AddonInstance* addon)
+                      {
+                        addon->toAddon->CloseLiveStream(addon);
+@@ -1898,7 +1898,7 @@ PVR_ERROR CPVRClient::CloseLiveStream()
+ 
+ PVR_ERROR CPVRClient::CloseRecordedStream(int64_t streamId)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [streamId](const AddonInstance* addon)
+                      {
+                        addon->toAddon->CloseRecordedStream(addon, streamId);
+@@ -1911,7 +1911,7 @@ PVR_ERROR CPVRClient::IsRecordedStreamRealTime(int64_t streamId, bool& isRealTim
+   if (m_clientCapabilities.SupportsMultipleRecordedStreams())
+   {
+     return DoAddonCall(
+-        std::source_location::current().function_name(),
++        __FUNCTION__,
+         [streamId, &isRealTime](const AddonInstance* addon)
+         { return addon->toAddon->IsRecordedStreamRealTime(addon, streamId, &isRealTime); });
+   }
+@@ -1925,7 +1925,7 @@ PVR_ERROR CPVRClient::PauseRecordedStream(int64_t streamId, bool paused)
+ {
+   if (m_clientCapabilities.SupportsMultipleRecordedStreams())
+   {
+-    return DoAddonCall(std::source_location::current().function_name(),
++    return DoAddonCall(__FUNCTION__,
+                        [streamId, paused](const AddonInstance* addon)
+                        { return addon->toAddon->PauseRecordedStream(addon, streamId, paused); });
+   }
+@@ -1939,7 +1939,7 @@ PVR_ERROR CPVRClient::GetRecordedStreamTimes(int64_t streamId, PVR_STREAM_TIMES*
+ {
+   if (m_clientCapabilities.SupportsMultipleRecordedStreams())
+   {
+-    return DoAddonCall(std::source_location::current().function_name(),
++    return DoAddonCall(__FUNCTION__,
+                        [streamId, &times](const AddonInstance* addon)
+                        { return addon->toAddon->GetRecordedStreamTimes(addon, streamId, times); });
+   }
+@@ -1951,7 +1951,7 @@ PVR_ERROR CPVRClient::GetRecordedStreamTimes(int64_t streamId, PVR_STREAM_TIMES*
+ 
+ PVR_ERROR CPVRClient::PauseStream(bool bPaused)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [bPaused](const AddonInstance* addon)
+                      {
+                        addon->toAddon->PauseStream(addon, bPaused);
+@@ -1961,7 +1961,7 @@ PVR_ERROR CPVRClient::PauseStream(bool bPaused)
+ 
+ PVR_ERROR CPVRClient::SetSpeed(int speed)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [speed](const AddonInstance* addon)
+                      {
+                        addon->toAddon->SetSpeed(addon, speed);
+@@ -1971,7 +1971,7 @@ PVR_ERROR CPVRClient::SetSpeed(int speed)
+ 
+ PVR_ERROR CPVRClient::FillBuffer(bool mode)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [mode](const AddonInstance* addon)
+                      {
+                        addon->toAddon->FillBuffer(addon, mode);
+@@ -1982,7 +1982,7 @@ PVR_ERROR CPVRClient::FillBuffer(bool mode)
+ PVR_ERROR CPVRClient::CanPauseStream(bool& bCanPause) const
+ {
+   bCanPause = false;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&bCanPause](const AddonInstance* addon)
+                      {
+                        bCanPause = addon->toAddon->CanPauseStream(addon);
+@@ -1993,7 +1993,7 @@ PVR_ERROR CPVRClient::CanPauseStream(bool& bCanPause) const
+ PVR_ERROR CPVRClient::CanSeekStream(bool& bCanSeek) const
+ {
+   bCanSeek = false;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&bCanSeek](const AddonInstance* addon)
+                      {
+                        bCanSeek = addon->toAddon->CanSeekStream(addon);
+@@ -2003,7 +2003,7 @@ PVR_ERROR CPVRClient::CanSeekStream(bool& bCanSeek) const
+ 
+ PVR_ERROR CPVRClient::GetStreamTimes(PVR_STREAM_TIMES* times) const
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&times](const AddonInstance* addon)
+                      { return addon->toAddon->GetStreamTimes(addon, times); });
+ }
+@@ -2011,7 +2011,7 @@ PVR_ERROR CPVRClient::GetStreamTimes(PVR_STREAM_TIMES* times) const
+ PVR_ERROR CPVRClient::IsRealTimeStream(bool& bRealTime) const
+ {
+   bRealTime = false;
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&bRealTime](const AddonInstance* addon)
+                      {
+                        bRealTime = addon->toAddon->IsRealTimeStream(addon);
+@@ -2022,7 +2022,7 @@ PVR_ERROR CPVRClient::IsRealTimeStream(bool& bRealTime) const
+ PVR_ERROR CPVRClient::OnSystemSleep()
+ {
+   const PVR_ERROR ret =
+-      DoAddonCall(std::source_location::current().function_name(),
++      DoAddonCall(__FUNCTION__,
+                   [](const AddonInstance* addon) { return addon->toAddon->OnSystemSleep(addon); });
+   m_bBlockAddonCalls = true;
+   return ret;
+@@ -2031,19 +2031,19 @@ PVR_ERROR CPVRClient::OnSystemSleep()
+ PVR_ERROR CPVRClient::OnSystemWake()
+ {
+   m_bBlockAddonCalls = false;
+-  return DoAddonCall(std::source_location::current().function_name(), [](const AddonInstance* addon)
++  return DoAddonCall(__FUNCTION__, [](const AddonInstance* addon)
+                      { return addon->toAddon->OnSystemWake(addon); });
+ }
+ 
+ PVR_ERROR CPVRClient::OnPowerSavingActivated()
+ {
+-  return DoAddonCall(std::source_location::current().function_name(), [](const AddonInstance* addon)
++  return DoAddonCall(__FUNCTION__, [](const AddonInstance* addon)
+                      { return addon->toAddon->OnPowerSavingActivated(addon); });
+ }
+ 
+ PVR_ERROR CPVRClient::OnPowerSavingDeactivated()
+ {
+-  return DoAddonCall(std::source_location::current().function_name(), [](const AddonInstance* addon)
++  return DoAddonCall(__FUNCTION__, [](const AddonInstance* addon)
+                      { return addon->toAddon->OnPowerSavingDeactivated(addon); });
+ }
+ 
+@@ -2058,7 +2058,7 @@ std::shared_ptr<CPVRClientMenuHooks> CPVRClient::GetMenuHooks() const
+ PVR_ERROR CPVRClient::CallEpgTagMenuHook(const CPVRClientMenuHook& hook,
+                                          const std::shared_ptr<const CPVREpgInfoTag>& tag)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&hook, &tag](const AddonInstance* addon)
+                      {
+                        CAddonEpgTag addonTag(*tag);
+@@ -2075,7 +2075,7 @@ PVR_ERROR CPVRClient::CallEpgTagMenuHook(const CPVRClientMenuHook& hook,
+ PVR_ERROR CPVRClient::CallChannelMenuHook(const CPVRClientMenuHook& hook,
+                                           const std::shared_ptr<const CPVRChannel>& channel)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&hook, &channel](const AddonInstance* addon)
+                      {
+                        const CAddonChannel addonChannel{*channel};
+@@ -2093,7 +2093,7 @@ PVR_ERROR CPVRClient::CallRecordingMenuHook(const CPVRClientMenuHook& hook,
+                                             const std::shared_ptr<const CPVRRecording>& recording,
+                                             bool bDeleted)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&hook, &recording, &bDeleted](const AddonInstance* addon)
+                      {
+                        const CAddonRecording tag(*recording);
+@@ -2111,7 +2111,7 @@ PVR_ERROR CPVRClient::CallRecordingMenuHook(const CPVRClientMenuHook& hook,
+ PVR_ERROR CPVRClient::CallTimerMenuHook(const CPVRClientMenuHook& hook,
+                                         const std::shared_ptr<const CPVRTimerInfoTag>& timer)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&hook, &timer](const AddonInstance* addon)
+                      {
+                        const CAddonTimer tag(*timer);
+@@ -2127,7 +2127,7 @@ PVR_ERROR CPVRClient::CallTimerMenuHook(const CPVRClientMenuHook& hook,
+ 
+ PVR_ERROR CPVRClient::CallSettingsMenuHook(const CPVRClientMenuHook& hook)
+ {
+-  return DoAddonCall(std::source_location::current().function_name(),
++  return DoAddonCall(__FUNCTION__,
+                      [&hook](const AddonInstance* addon)
+                      {
+                        PVR_MENUHOOK menuHook;
+@@ -2218,7 +2218,7 @@ void CPVRClient::cb_transfer_channel_group(void* kodiInstance,
+                                            const PVR_HANDLE handle,
+                                            const PVR_CHANNEL_GROUP* group)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [handle, group](const CPVRClient* client)
+                       {
+                         if (!handle || !group)
+@@ -2246,7 +2246,7 @@ void CPVRClient::cb_transfer_channel_group_member(void* kodiInstance,
+                                                   const PVR_CHANNEL_GROUP_MEMBER* member)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [handle, member](const CPVRClient* client)
+       {
+         if (!handle || !member)
+@@ -2277,7 +2277,7 @@ void CPVRClient::cb_transfer_epg_entry(void* kodiInstance,
+                                        const PVR_HANDLE handle,
+                                        const EPG_TAG* epgentry)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [handle, epgentry](const CPVRClient* client)
+                       {
+                         if (!handle || !epgentry)
+@@ -2297,7 +2297,7 @@ void CPVRClient::cb_transfer_provider_entry(void* kodiInstance,
+                                             const PVR_PROVIDER* provider)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [handle, provider](const CPVRClient* client)
+       {
+         if (!handle || !provider)
+@@ -2318,7 +2318,7 @@ void CPVRClient::cb_transfer_channel_entry(void* kodiInstance,
+                                            const PVR_CHANNEL* channel)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [handle, channel](const CPVRClient* client)
+       {
+         if (!handle || !channel)
+@@ -2337,7 +2337,7 @@ void CPVRClient::cb_transfer_recording_entry(void* kodiInstance,
+                                              const PVR_HANDLE handle,
+                                              const PVR_RECORDING* recording)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [handle, recording](const CPVRClient* client)
+                       {
+                         if (!handle || !recording)
+@@ -2358,7 +2358,7 @@ void CPVRClient::cb_transfer_timer_entry(void* kodiInstance,
+                                          const PVR_HANDLE handle,
+                                          const PVR_TIMER* timer)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [handle, timer](const CPVRClient* client)
+                       {
+                         if (!handle || !timer)
+@@ -2383,7 +2383,7 @@ void CPVRClient::cb_transfer_timer_entry(void* kodiInstance,
+ 
+ void CPVRClient::cb_add_menu_hook(void* kodiInstance, const PVR_MENUHOOK* hook)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [hook](const CPVRClient* client)
+                       {
+                         if (!hook)
+@@ -2402,7 +2402,7 @@ void CPVRClient::cb_recording_notification(void* kodiInstance,
+                                            bool bOnOff)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [strName, strFileName, bOnOff](const CPVRClient* client)
+       {
+         if (!strFileName)
+@@ -2432,7 +2432,7 @@ void CPVRClient::cb_recording_notification(void* kodiInstance,
+ 
+ void CPVRClient::cb_trigger_channel_update(void* kodiInstance)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [](const CPVRClient* client)
+                       {
+                         // update channels in the next iteration of the pvrmanager's main loop
+@@ -2442,7 +2442,7 @@ void CPVRClient::cb_trigger_channel_update(void* kodiInstance)
+ 
+ void CPVRClient::cb_trigger_provider_update(void* kodiInstance)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [](const CPVRClient* client)
+                       {
+                         /* update the providers table in the next iteration of the pvrmanager's main loop */
+@@ -2452,7 +2452,7 @@ void CPVRClient::cb_trigger_provider_update(void* kodiInstance)
+ 
+ void CPVRClient::cb_trigger_timer_update(void* kodiInstance)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [](const CPVRClient* client)
+                       {
+                         // update timers in the next iteration of the pvrmanager's main loop
+@@ -2462,7 +2462,7 @@ void CPVRClient::cb_trigger_timer_update(void* kodiInstance)
+ 
+ void CPVRClient::cb_trigger_recording_update(void* kodiInstance)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [](const CPVRClient* client)
+                       {
+                         // update recordings in the next iteration of the pvrmanager's main loop
+@@ -2472,7 +2472,7 @@ void CPVRClient::cb_trigger_recording_update(void* kodiInstance)
+ 
+ void CPVRClient::cb_trigger_channel_groups_update(void* kodiInstance)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [](const CPVRClient* client)
+                       {
+                         // update all channel groups in the next iteration of the pvrmanager's main loop
+@@ -2482,7 +2482,7 @@ void CPVRClient::cb_trigger_channel_groups_update(void* kodiInstance)
+ 
+ void CPVRClient::cb_trigger_epg_update(void* kodiInstance, unsigned int iChannelUid)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [iChannelUid](const CPVRClient* client) {
+                         CServiceBroker::GetPVRManager().EpgContainer().UpdateRequest(
+                             client->GetID(), iChannelUid);
+@@ -2492,7 +2492,7 @@ void CPVRClient::cb_trigger_epg_update(void* kodiInstance, unsigned int iChannel
+ void CPVRClient::cb_free_demux_packet(void* kodiInstance, DEMUX_PACKET* pPacket)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [pPacket](const CPVRClient* /*client*/)
+       { CDVDDemuxUtils::FreeDemuxPacket(static_cast<DemuxPacket*>(pPacket)); }, true);
+ }
+@@ -2502,7 +2502,7 @@ DEMUX_PACKET* CPVRClient::cb_allocate_demux_packet(void* kodiInstance, int iData
+   DEMUX_PACKET* result = nullptr;
+ 
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [iDataSize, &result](const CPVRClient* /*client*/)
+       { result = CDVDDemuxUtils::AllocateDemuxPacket(iDataSize); }, true);
+ 
+@@ -2514,7 +2514,7 @@ void CPVRClient::cb_connection_state_change(void* kodiInstance,
+                                             PVR_CONNECTION_STATE newState,
+                                             const char* strMessage)
+ {
+-  HandleAddonCallback(std::source_location::current().function_name(), kodiInstance,
++  HandleAddonCallback(__FUNCTION__, kodiInstance,
+                       [strConnectionString, newState, strMessage](CPVRClient* client)
+                       {
+                         if (!strConnectionString)
+@@ -2547,7 +2547,7 @@ void CPVRClient::cb_epg_event_state_change(void* kodiInstance,
+                                            EPG_EVENT_STATE newState)
+ {
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [tag, newState](const CPVRClient* client)
+       {
+         if (!tag)
+@@ -2634,7 +2634,7 @@ PVR_CODEC CPVRClient::cb_get_codec_by_name(const void* kodiInstance, const char*
+   PVR_CODEC result = PVR_INVALID_CODEC;
+ 
+   HandleAddonCallback(
+-      std::source_location::current().function_name(), kodiInstance,
++      __FUNCTION__, kodiInstance,
+       [&result, strCodecName](const CPVRClient* client)
+       { result = CCodecIds::GetInstance().GetCodecByName(strCodecName); }, true);
+ 

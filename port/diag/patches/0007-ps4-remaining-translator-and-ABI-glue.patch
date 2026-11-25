@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:37 -0300
+Subject: [PATCH 07/12] ps4: remaining translator and ABI glue
+
+Keep the remaining platform-specific fixes that do not belong to the build, windowing, network, audio or input groups.
+---
+ xbmc/filesystem/BlurayDirectory.cpp          | 41 +++++++++++-------
+ xbmc/platform/posix/filesystem/PosixFile.cpp | 45 +++++++++++++++++++-
+ xbmc/platform/posix/filesystem/PosixFile.h   |  3 ++
+ xbmc/pvr/guilib/PVRGUIActionsClients.cpp     |  7 +--
+ 4 files changed, 76 insertions(+), 20 deletions(-)
+
+diff --git a/xbmc/filesystem/BlurayDirectory.cpp b/xbmc/filesystem/BlurayDirectory.cpp
+index 1577959ff7..e5bbbba7c1 100644
+--- a/xbmc/filesystem/BlurayDirectory.cpp
++++ b/xbmc/filesystem/BlurayDirectory.cpp
+@@ -40,7 +40,6 @@
+ #include <cstdint>
+ #include <map>
+ #include <memory>
+-#include <ranges>
+ #include <string>
+ #include <string_view>
+ #include <unordered_set>
+@@ -347,7 +346,10 @@ bool CBlurayDirectory::FilterPlaylists(std::vector<PlaylistInformation>& playlis
+   // isn't on the disc at all
+   const auto Remove{[&playlists](std::string_view reason, const auto& shouldRemove)
+                     {
+-                      for (const auto& playlist : playlists | std::views::filter(shouldRemove))
++                      for (const auto& playlist : playlists)
++                      {
++                        if (!shouldRemove(playlist))
++                          continue;
+                         CLog::LogFC(LOGDEBUG, LOGBLURAY, "Discarding playlist {} - {}",
+                                     playlist.playlist, reason);
+                       std::erase_if(playlists, shouldRemove);
+@@ -395,6 +397,21 @@ void AddPlaylists(const CURL& url,
+   for (auto& title : playlists)
+     items.Add(GetFileItem(url, realPath, title, clipCache, StreamDetails::DEFER));
+ }
++
++//! The streams' languages, comma separated
++template<typename Streams>
++std::string LanguagesOf(const Streams& streams)
++{
++  const auto language = [](const auto& stream) { return stream.language.AsBcp47(); };
++  std::string joined;
++  for (const auto& st : streams)
++  {
++    if (!joined.empty())
++      joined += ",";
++    joined += language(st);
++  }
++  return fmt::format("{}", joined);
++}
+ } // namespace
+ 
+ bool CBlurayDirectory::GetPlaylists(const CURL& url,
+@@ -479,17 +496,13 @@ void CBlurayDirectory::ProcessPlaylist(PlaylistMap& playlists,
+     else
+     {
+       // Additional reference to clip, add this playlist
+-      if (std::ranges::find(it->second.playlists, playlist) == it->second.playlists.end())
++      if (std::find(it->second.playlists.begin(), it->second.playlists.end(), playlist) == it->second.playlists.end())
+         it->second.playlists.push_back(playlist);
+     }
+   }
+ 
+   // Get languages
+-  titleInfo.languages =
+-      fmt::format("{}", fmt::join(titleInfo.audioStreams |
+-                                      std::views::transform([](const auto& stream)
+-                                                            { return stream.language.AsBcp47(); }),
+-                                  ","));
++  titleInfo.languages = LanguagesOf(titleInfo.audioStreams);
+ 
+   // Saved as a whole, so a field added to PlaylistInformation reaches the playlist map without
+   // having to be added here too
+@@ -542,11 +555,7 @@ bool CBlurayDirectory::GetPlaylistsInformation(const CURL& url,
+ 
+       CLog::LogF(LOGDEBUG, "Playlist {}, Duration {}, Langs {}, Subs {}, Clips {} ", playlist,
+                  title->GetVideoInfoTag()->GetDuration(), titleInfo.languages,
+-                 fmt::join(titleInfo.pgStreams |
+-                               std::views::transform([](const auto& stream)
+-                                                     { return stream.language.AsBcp47(); }),
+-                           ","),
+-                 fmt::join(titleInfo.clips, ","));
++                 LanguagesOf(titleInfo.pgStreams), fmt::join(titleInfo.clips, ","));
+     }
+ 
+     // List clip info (automatically sorted as map)
+@@ -869,8 +878,8 @@ bool CBlurayDirectory::GetDirectory(const CURL& url, CFileItemList& items)
+         // Update data with database information (where available)
+         for (auto& episode : episodesOnDisc)
+         {
+-          const auto& it{std::ranges::find_if(
+-              episodesInDatabase, [&episode](const CVideoInfoTag& e)
++          const auto& it{std::find_if(episodesInDatabase.begin(), episodesInDatabase.end(),
++              [&episode](const CVideoInfoTag& e)
+               { return e.m_iSeason == episode.iSeason && e.m_iEpisode == episode.iEpisode; })};
+           if (it != episodesInDatabase.end())
+           {
+@@ -892,7 +901,7 @@ bool CBlurayDirectory::GetDirectory(const CURL& url, CFileItemList& items)
+ 
+         // Check desired episode is on disc
+         const auto& it{
+-            std::ranges::find_if(episodesOnDisc, [&season, &episode](const Episode& e)
++            std::find_if(episodesOnDisc.begin(), episodesOnDisc.end(), [&season, &episode](const Episode& e)
+                                  { return e.iSeason == season && e.iEpisode == episode; })};
+         if (it == episodesOnDisc.end())
+           return false; // Episode not on disc
+diff --git a/xbmc/platform/posix/filesystem/PosixFile.cpp b/xbmc/platform/posix/filesystem/PosixFile.cpp
+index a093f7e821..5370902bf3 100644
+--- a/xbmc/platform/posix/filesystem/PosixFile.cpp
++++ b/xbmc/platform/posix/filesystem/PosixFile.cpp
+@@ -58,6 +58,8 @@ bool CPosixFile::Open(const CURL& url)
+ 
+   m_fd = open(filename.c_str(), O_RDONLY, S_IRUSR | S_IRGRP | S_IROTH);
+   m_filePos = 0;
++  if (m_fd >= 0)
++    m_filename = filename;
+ 
+   return m_fd != -1;
+ }
+@@ -76,6 +78,7 @@ bool CPosixFile::OpenForWrite(const CURL& url, bool bOverWrite /* = false*/ )
+     return false;
+ 
+   m_filePos = 0;
++  m_filename = filename;
+   m_allowWrite = true;
+ 
+   return true;
+@@ -87,6 +90,7 @@ void CPosixFile::Close()
+   {
+     close(m_fd);
+     m_fd = -1;
++    m_filename.clear();
+     m_filePos = -1;
+     m_lastDropPos = -1;
+     m_allowWrite = false;
+@@ -211,6 +215,20 @@ int64_t CPosixFile::GetLength()
+   if (m_fd < 0)
+     return -1;
+ 
++#if defined(TARGET_PS4)
++  // The PS4 kernel's stat layout does not match the SDK's struct stat:
++  // st_size can be a small unrelated value (e.g. 32128 for a 16 MB file),
++  // which breaks MP4s whose moov atom is at the end. lseek(SEEK_END) is
++  // reliable and keeps the current file position intact.
++  const off_t savedPos = lseek(m_fd, 0, SEEK_CUR);
++  if (savedPos >= 0)
++  {
++    const off_t endPos = lseek(m_fd, 0, SEEK_END);
++    if (lseek(m_fd, savedPos, SEEK_SET) >= 0 && endPos >= 0)
++      return endPos;
++  }
++#endif
++
+   struct stat64 st;
+   if (fstat64(m_fd, &st) != 0)
+     return -1;
+@@ -374,7 +392,22 @@ int CPosixFile::Stat(const CURL& url, struct __stat64* buffer)
+   }
+   return ret;
+ #else
+-  return stat64(filename.c_str(), buffer);
++  const int ret = stat64(filename.c_str(), buffer);
++#if defined(TARGET_PS4)
++  // st_size is not trustworthy on PS4; lseek(SEEK_END) gives the real size.
++  if (ret == 0 && S_ISREG(buffer->st_mode))
++  {
++    const int fd = open(filename.c_str(), O_RDONLY);
++    if (fd >= 0)
++    {
++      const off_t endPos = lseek(fd, 0, SEEK_END);
++      close(fd);
++      if (endPos >= 0)
++        buffer->st_size = endPos;
++    }
++  }
++#endif
++  return ret;
+ #endif
+ }
+ 
+@@ -384,5 +417,15 @@ int CPosixFile::Stat(struct __stat64* buffer)
+   if (m_fd < 0 || !buffer)
+     return -1;
+ 
++#if defined(TARGET_PS4)
++  if (!m_filename.empty() && stat64(m_filename.c_str(), buffer) == 0)
++  {
++    const int64_t length = GetLength();
++    if (length >= 0)
++      buffer->st_size = length;
++    return 0;
++  }
++#endif
++
+   return fstat64(m_fd, buffer);
+ }
+diff --git a/xbmc/platform/posix/filesystem/PosixFile.h b/xbmc/platform/posix/filesystem/PosixFile.h
+index c202d238dc..1195f61a58 100644
+--- a/xbmc/platform/posix/filesystem/PosixFile.h
++++ b/xbmc/platform/posix/filesystem/PosixFile.h
+@@ -10,6 +10,8 @@
+ 
+ #include "filesystem/IFile.h"
+ 
++#include <string>
++
+ namespace XFILE
+ {
+ 
+@@ -38,6 +40,7 @@ namespace XFILE
+     int Stat(struct __stat64* buffer) override;
+ 
+   protected:
++    std::string m_filename;
+     int     m_fd = -1;
+     int64_t m_filePos = -1;
+     int64_t m_lastDropPos = -1;
+diff --git a/xbmc/pvr/guilib/PVRGUIActionsClients.cpp b/xbmc/pvr/guilib/PVRGUIActionsClients.cpp
+index 1391e5f36d..60120b66f9 100644
+--- a/xbmc/pvr/guilib/PVRGUIActionsClients.cpp
++++ b/xbmc/pvr/guilib/PVRGUIActionsClients.cpp
+@@ -36,11 +36,12 @@ bool CPVRGUIActionsClients::ProcessSettingsMenuHooks() const
+   const CPVRClientMap clients = CServiceBroker::GetPVRManager().Clients()->GetCreatedClients();
+ 
+   std::vector<std::pair<std::shared_ptr<CPVRClient>, CPVRClientMenuHook>> settingsHooks;
+-  for (const auto& client : std::views::values(clients))
++  for (const auto& clientEntry : clients)
+   {
++    const auto& client = clientEntry.second;
+     const auto hooks = client->GetMenuHooks()->GetSettingsHooks();
+-    std::ranges::transform(hooks, std::back_inserter(settingsHooks),
+-                           [&client](const auto& hook) { return std::make_pair(client, hook); });
++    for (const auto& hook : hooks)
++      settingsHooks.emplace_back(client, hook);
+   }
+ 
+   if (settingsHooks.empty())

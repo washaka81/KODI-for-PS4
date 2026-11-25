@@ -1,0 +1,1151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:36 -0300
+Subject: [PATCH 05/12] ps4: audio and input platform
+
+Add the 48 kHz sceAudioOut sink and the DualShock/media-remote input driver. Platform key edges are queued for InputManager so actions run on the input thread.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp |  14 +-
+ xbmc/guilib/GUIAudioManager.cpp               |   5 +
+ xbmc/input/InputManager.cpp                   |  29 ++-
+ xbmc/input/InputManager.h                     |  30 +++
+ xbmc/platform/ps4/CAESinkPS4.cpp              | 194 ++++++++++++++++
+ xbmc/platform/ps4/CAESinkPS4.h                |  56 +++++
+ xbmc/platform/ps4/CPadPS4.cpp                 | 117 ++++++++++
+ xbmc/platform/ps4/CPadPS4.h                   |  43 ++++
+ xbmc/platform/ps4/PS4AudioSink.cpp            | 190 +++++++++++++++
+ xbmc/platform/ps4/PS4AudioSink.h              |  36 +++
+ xbmc/platform/ps4/PS4Input.cpp                | 218 ++++++++++++++++++
+ xbmc/platform/ps4/PS4Input.h                  |  42 ++++
+ 12 files changed, 968 insertions(+), 6 deletions(-)
+ create mode 100644 xbmc/platform/ps4/CAESinkPS4.cpp
+ create mode 100644 xbmc/platform/ps4/CAESinkPS4.h
+ create mode 100644 xbmc/platform/ps4/CPadPS4.cpp
+ create mode 100644 xbmc/platform/ps4/CPadPS4.h
+ create mode 100644 xbmc/platform/ps4/PS4AudioSink.cpp
+ create mode 100644 xbmc/platform/ps4/PS4AudioSink.h
+ create mode 100644 xbmc/platform/ps4/PS4Input.cpp
+ create mode 100644 xbmc/platform/ps4/PS4Input.h
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index 52d03d244c..20d709106f 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -2369,7 +2369,7 @@ bool CActiveAE::RunStages()
+                 CAEUtil::SSEMulAddArray(dst, src, volume, nb_floats);
+                 for (int k = 0; k < nb_floats; ++k)
+                 {
+-                  if (fabs(dst[k]) > 1.0f)
++                  if (fabsf(dst[k]) > 1.0f)
+                   {
+                     needClamp = true;
+                     break;
+@@ -2379,7 +2379,7 @@ bool CActiveAE::RunStages()
+                 for (int k = 0; k < nb_floats; ++k)
+                 {
+                   dst[k] += src[k] * volume;
+-                  if (fabs(dst[k]) > 1.0f)
++                  if (fabsf(dst[k]) > 1.0f)
+                     needClamp = true;
+                 }
+ #endif
+@@ -3485,6 +3485,14 @@ IAE::SoundPtr CActiveAE::MakeSound(const std::string& file)
+         if (!init)
+         {
+           int samples = fileSize / av_get_bytes_per_sample(dec_ctx->sample_fmt) / config.channels;
++#if defined(TARGET_PS4)
++          // PFS can report a short length for files inside the app package.
++          // Reserve enough space for short GUI sounds instead of failing in
++          // CActiveAESound::StoreSound with "exceeded max samples".
++          const int min_samples = config.sample_rate * 5;
++          if (samples < min_samples)
++            samples = min_samples;
++#endif
+           config.fmt = dec_ctx->sample_fmt;
+           config.bits_per_sample = dec_ctx->bits_per_coded_sample;
+           sound->InitSound(true, config, samples);
+@@ -3820,7 +3828,7 @@ void CActiveAE::RegisterAudioCallback(IAudioCallback* pCallback)
+ void CActiveAE::UnregisterAudioCallback(IAudioCallback* pCallback)
+ {
+   std::unique_lock lock(m_vizLock);
+-  auto it = std::ranges::find(m_audioCallback, pCallback);
++  auto it = std::find(m_audioCallback.begin(), m_audioCallback.end(), pCallback);
+   if (it != m_audioCallback.end())
+     m_audioCallback.erase(it);
+ }
+diff --git a/xbmc/guilib/GUIAudioManager.cpp b/xbmc/guilib/GUIAudioManager.cpp
+index e5f9b34dad..950d21d699 100644
+--- a/xbmc/guilib/GUIAudioManager.cpp
++++ b/xbmc/guilib/GUIAudioManager.cpp
+@@ -227,6 +227,11 @@ std::string GetSoundSkinPath()
+ bool CGUIAudioManager::Load()
+ {
+   std::unique_lock lock(m_cs);
++
++  // Stop playing sounds before dropping the maps they live in.  Otherwise the
++  // audio thread can still hold a raw pointer to a sound that was destroyed by
++  // UnLoad() during a skin reload.
++  Stop();
+   UnLoad();
+ 
+   m_strMediaDir = GetSoundSkinPath();
+diff --git a/xbmc/input/InputManager.cpp b/xbmc/input/InputManager.cpp
+index 4097ac63d2..f4887772b8 100644
+--- a/xbmc/input/InputManager.cpp
++++ b/xbmc/input/InputManager.cpp
+@@ -309,6 +309,23 @@ void CInputManager::ProcessCec()
+ 
+ void CInputManager::ProcessQueuedActions()
+ {
++  // Process platform keys first: the pad driver queues press/release edges
++  // from its poll, and they must be handled at a deterministic point in
++  // the frame instead of inside CPadPS4::Poll().
++  std::vector<QueuedKey> queuedPlatformKeys;
++  {
++    std::unique_lock lock(m_platformKeyMutex);
++    queuedPlatformKeys.swap(m_queuedPlatformKeys);
++  }
++
++  for (const QueuedKey& queued : queuedPlatformKeys)
++  {
++    if (queued.pressed)
++      OnKey(queued.key);
++    else
++      OnKeyUp(queued.key);
++  }
++
+   // Process actions
+   std::vector<CAction> queuedActions;
+   {
+@@ -330,6 +347,12 @@ void CInputManager::ProcessQueuedActions()
+     OnKey(key);
+ }
+ 
++void CInputManager::QueueKey(const CKey& key, bool pressed)
++{
++  std::unique_lock lock(m_platformKeyMutex);
++  m_queuedPlatformKeys.push_back({key, pressed});
++}
++
+ void CInputManager::QueueAction(const CAction& action)
+ {
+   std::unique_lock lock(m_actionMutex);
+@@ -957,7 +980,7 @@ std::vector<std::shared_ptr<const KEYMAP::IWindowKeymap>> CInputManager::GetJoys
+ 
+ void CInputManager::RegisterKeyboardDriverHandler(KEYBOARD::IKeyboardDriverHandler* handler)
+ {
+-  if (std::ranges::find(m_keyboardHandlers, handler) == m_keyboardHandlers.end())
++  if (std::find(m_keyboardHandlers.begin(), m_keyboardHandlers.end(), handler) == m_keyboardHandlers.end())
+     m_keyboardHandlers.insert(m_keyboardHandlers.begin(), handler);
+ }
+ 
+@@ -970,7 +993,7 @@ void CInputManager::UnregisterKeyboardDriverHandler(KEYBOARD::IKeyboardDriverHan
+ 
+ void CInputManager::RegisterMouseDriverHandler(MOUSE::IMouseDriverHandler* handler)
+ {
+-  if (std::ranges::find(m_mouseHandlers, handler) == m_mouseHandlers.end())
++  if (std::find(m_mouseHandlers.begin(), m_mouseHandlers.end(), handler) == m_mouseHandlers.end())
+     m_mouseHandlers.insert(m_mouseHandlers.begin(), handler);
+ }
+ 
+@@ -984,7 +1007,7 @@ void CInputManager::RegisterCecInputProvider(CEC::ICecInputProvider* handler)
+ {
+   std::unique_lock lock(m_cecHandlingMutex);
+ 
+-  if (std::ranges::find(m_cecInputProviders, handler) == m_cecInputProviders.end())
++  if (std::find(m_cecInputProviders.begin(), m_cecInputProviders.end(), handler) == m_cecInputProviders.end())
+     m_cecInputProviders.emplace_back(handler);
+ }
+ 
+diff --git a/xbmc/input/InputManager.h b/xbmc/input/InputManager.h
+index 3e41d0f5df..bf1ae0743a 100644
+--- a/xbmc/input/InputManager.h
++++ b/xbmc/input/InputManager.h
+@@ -236,6 +236,28 @@ public:
+   // implementation of IActionListener
+   bool OnAction(const CAction& action) override;
+ 
++  /*!
++   * \brief Inject a key press from a platform input driver
++   *
++   * Unlike OnEvent() this takes a CKey directly, so a platform can map its
++   * native buttons to the key codes used by Kodi's keymaps.
++   */
++  bool InjectKey(const CKey& key) { return OnKey(key); }
++
++  /*!
++   * \brief Inject a key release from a platform input driver
++   */
++  void InjectKeyUp(const CKey& key) { OnKeyUp(key); }
++
++  /*!
++   * \brief Queue a platform key edge for the next Process() call
++   *
++   * Platform drivers should use this instead of InjectKey()/InjectKeyUp()
++   * so the action is handled by the input thread at a deterministic point
++   * in the frame, not in the middle of the platform poll.
++   */
++  void QueueKey(const CKey& key, bool pressed);
++
+   void RegisterKeyboardDriverHandler(KODI::KEYBOARD::IKeyboardDriverHandler* handler);
+   void UnregisterKeyboardDriverHandler(KODI::KEYBOARD::IKeyboardDriverHandler* handler);
+ 
+@@ -311,6 +333,14 @@ private:
+   CCriticalSection m_cecKeyMutex;
+   CCriticalSection m_cecHandlingMutex;
+ 
++  struct QueuedKey
++  {
++    CKey key;
++    bool pressed;
++  };
++  std::vector<QueuedKey> m_queuedPlatformKeys;
++  CCriticalSection m_platformKeyMutex;
++
+   // Button translation
+   std::unique_ptr<KODI::KEYMAP::IKeymapEnvironment> m_keymapEnvironment;
+   std::unique_ptr<KODI::KEYMAP::CButtonTranslator> m_buttonTranslator;
+diff --git a/xbmc/platform/ps4/CAESinkPS4.cpp b/xbmc/platform/ps4/CAESinkPS4.cpp
+new file mode 100644
+index 0000000000..e9bc62d934
+--- /dev/null
++++ b/xbmc/platform/ps4/CAESinkPS4.cpp
+@@ -0,0 +1,194 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "CAESinkPS4.h"
++
++#include "cores/AudioEngine/AESinkFactory.h"
++#include "cores/AudioEngine/Utils/AEUtil.h"
++#include "utils/TimeUtils.h"
++#include "utils/log.h"
++
++#include <algorithm>
++#include <chrono>
++#include <thread>
++
++using namespace std::chrono_literals;
++
++namespace
++{
++constexpr auto DEFAULT_PERIOD_TIME = 50ms;
++} // namespace
++
++namespace kodi::ps4
++{
++
++void CAESinkPS4::Register()
++{
++  AE::AESinkRegEntry entry;
++  entry.sinkName = "PS4";
++  entry.createFunc = CAESinkPS4::Create;
++  entry.enumerateFunc = CAESinkPS4::EnumerateDevicesEx;
++  entry.cleanupFunc = CAESinkPS4::Cleanup;
++  AE::CAESinkFactory::RegisterSink(entry);
++}
++
++std::unique_ptr<IAESink> CAESinkPS4::Create(std::string& device, AEAudioFormat& desiredFormat)
++{
++  auto sink = std::make_unique<CAESinkPS4>();
++  if (sink->Initialize(desiredFormat, device))
++    return sink;
++
++  return {};
++}
++
++void CAESinkPS4::EnumerateDevicesEx(AEDeviceInfoList& list, bool force)
++{
++  (void)force;
++
++  CAEDeviceInfo info;
++  info.m_deviceName = "ps4";
++  info.m_displayName = "PS4";
++  info.m_deviceType = AE_DEVTYPE_PCM;
++  info.m_channels = AE_CH_LAYOUT_2_0;
++  info.m_sampleRates = {48000};
++  info.m_dataFormats = {AE_FMT_S16NE, AE_FMT_FLOAT};
++  list.push_back(info);
++}
++
++void CAESinkPS4::Cleanup() {}
++
++bool CAESinkPS4::Initialize(AEAudioFormat& format, std::string& device)
++{
++  (void)device;
++  m_format = format;
++
++  if (m_format.m_sampleRate == 0)
++  {
++    CLog::LogF(LOGERROR, "PS4 audio: invalid sample rate");
++    return false;
++  }
++
++  if (m_format.m_dataFormat == AE_FMT_RAW)
++    m_format.m_dataFormat = AE_FMT_S16NE;
++
++  // ActiveAE hands the sink the decoder format (planar float for FFmpeg
++  // audio).  sceAudioOut only accepts interleaved S16/float, so pick a
++  // supported format here and let ActiveAE convert the samples.
++  if (m_format.m_dataFormat != AE_FMT_S16NE && m_format.m_dataFormat != AE_FMT_FLOAT)
++  {
++    const AEDataFormat requested = m_format.m_dataFormat;
++    m_format.m_dataFormat =
++        CAEUtil::DataFormatToBits(requested) > 16 ? AE_FMT_FLOAT : AE_FMT_S16NE;
++    m_format.m_frameSize = m_format.m_channelLayout.Count() *
++                           (CAEUtil::DataFormatToBits(m_format.m_dataFormat) >> 3);
++    CLog::LogF(LOGINFO, "PS4 audio: converting {} to {}",
++               CAEUtil::DataFormatToStr(requested),
++               CAEUtil::DataFormatToStr(m_format.m_dataFormat));
++  }
++  const bool float_format = m_format.m_dataFormat == AE_FMT_FLOAT;
++
++  /* Orbis AudioOut only accepts 48 kHz on the main port.  Channels with
++   * 44.1 kHz audio made sceAudioOutOpen fail with 0x80260008
++   * (INVALID_SAMPLE_FREQ), leaving the player without an audio sink and
++   * timing out.  Force the hardware rate and return it to ActiveAE so it
++   * resamples the stream. */
++  constexpr unsigned int kHardwareSampleRate = 48000;
++  if (m_format.m_sampleRate != kHardwareSampleRate)
++  {
++    CLog::LogF(LOGINFO, "PS4 audio: resampling {} Hz to {} Hz", m_format.m_sampleRate,
++               kHardwareSampleRate);
++    m_format.m_sampleRate = kHardwareSampleRate;
++  }
++
++  if (m_format.m_frameSize == 0)
++  {
++    m_format.m_frameSize =
++        m_format.m_channelLayout.Count() * (CAEUtil::DataFormatToBits(m_format.m_dataFormat) >> 3);
++    if (m_format.m_frameSize == 0)
++    {
++      CLog::LogF(LOGERROR, "PS4 audio: invalid frame size");
++      return false;
++    }
++  }
++
++  if (m_format.m_frames == 0)
++  {
++    m_format.m_frames = static_cast<unsigned int>(
++        m_format.m_sampleRate * std::chrono::duration<double>(DEFAULT_PERIOD_TIME).count());
++  }
++
++  if (!m_sink.Initialize(m_format.m_sampleRate, m_format.m_channelLayout.Count(), float_format))
++  {
++    CLog::LogF(LOGERROR, "PS4 audio: AudioOut initialization failed");
++    return false;
++  }
++
++  // Output fixed-size chunks from the sink; tell AE the same period and
++  // report one chunk as the hardware latency instead of a zero sink delay.
++  m_format.m_frames = m_sink.GetChunkFrames();
++  m_latency = std::chrono::duration<double>(
++      static_cast<double>(m_format.m_frames) / m_format.m_sampleRate);
++  format = m_format;
++  m_bufferLevel = 0s;
++  m_lastUpdateUs = CurrentHostCounter() / 1000;
++
++  CLog::LogF(LOGINFO, "PS4 audio: sink opened at {} Hz, {} channels, {} frames", m_format.m_sampleRate,
++             m_format.m_channelLayout.Count(), m_format.m_frames);
++  return true;
++}
++
++void CAESinkPS4::Deinitialize()
++{
++  m_sink.Shutdown();
++}
++
++void CAESinkPS4::UpdateBufferLevel()
++{
++  const int64_t nowUs = CurrentHostCounter() / 1000;
++  m_bufferLevel -=
++      std::chrono::duration<double>(static_cast<double>(nowUs - m_lastUpdateUs) / 1000000.0);
++  m_bufferLevel = std::max(m_bufferLevel, std::chrono::duration<double>::zero());
++  m_lastUpdateUs = nowUs;
++}
++
++unsigned int CAESinkPS4::AddPackets(uint8_t** data, unsigned int frames, unsigned int offset)
++{
++  UpdateBufferLevel();
++
++  const std::chrono::duration<double> duration(static_cast<double>(frames) /
++                                               m_format.m_sampleRate);
++  if (m_bufferLevel + duration > m_cacheTotal)
++  {
++    std::this_thread::sleep_for(m_bufferLevel + duration - m_cacheTotal);
++    UpdateBufferLevel();
++  }
++  m_bufferLevel += duration;
++
++  if (data && data[0] && frames > 0)
++  {
++    const size_t bytes = static_cast<size_t>(frames) * m_format.m_frameSize;
++    m_sink.Submit(data[0] + static_cast<size_t>(offset) * m_format.m_frameSize, bytes);
++  }
++
++  return frames;
++}
++
++void CAESinkPS4::GetDelay(AEDelayStatus& status)
++{
++  UpdateBufferLevel();
++  status.SetDelay((m_bufferLevel + m_latency).count());
++}
++
++void CAESinkPS4::Drain()
++{
++  UpdateBufferLevel();
++  std::this_thread::sleep_for(m_bufferLevel);
++  UpdateBufferLevel();
++}
++
++} // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/CAESinkPS4.h b/xbmc/platform/ps4/CAESinkPS4.h
+new file mode 100644
+index 0000000000..a0ecb3e467
+--- /dev/null
++++ b/xbmc/platform/ps4/CAESinkPS4.h
+@@ -0,0 +1,56 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "PS4AudioSink.h"
++#include "cores/AudioEngine/Interfaces/AESink.h"
++#include "cores/AudioEngine/Utils/AEDeviceInfo.h"
++
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace kodi::ps4
++{
++
++class CAESinkPS4 : public IAESink
++{
++public:
++  static void Register();
++  static std::unique_ptr<IAESink> Create(std::string& device, AEAudioFormat& desiredFormat);
++  static void EnumerateDevicesEx(AEDeviceInfoList& list, bool force);
++  static void Cleanup();
++
++  const char* GetName() override { return "PS4"; }
++
++  bool Initialize(AEAudioFormat& format, std::string& device) override;
++  void Deinitialize() override;
++
++  double GetCacheTotal() override { return m_cacheTotal.count(); }
++  double GetLatency() override { return m_latency.count(); }
++  void SetVolume(float volume) override { m_sink.SetVolume(volume); }
++
++  unsigned int AddPackets(uint8_t** data, unsigned int frames, unsigned int offset) override;
++  void GetDelay(AEDelayStatus& status) override;
++  void Drain() override;
++
++private:
++  void UpdateBufferLevel();
++
++  AEAudioFormat m_format{};
++  std::chrono::duration<double> m_cacheTotal{0.25};
++  std::chrono::duration<double> m_latency{0.0};
++  std::chrono::duration<double> m_bufferLevel{};
++  int64_t m_lastUpdateUs{0};
++  PS4AudioSink m_sink;
++};
++
++} // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/CPadPS4.cpp b/xbmc/platform/ps4/CPadPS4.cpp
+new file mode 100644
+index 0000000000..8b5a30637d
+--- /dev/null
++++ b/xbmc/platform/ps4/CPadPS4.cpp
+@@ -0,0 +1,117 @@
++#include "CPadPS4.h"
++
++#include "ServiceBroker.h"
++#include "input/InputManager.h"
++#include "input/keyboard/Key.h"
++#include "input/keymaps/keyboard/KeyIDs.h"
++#include "utils/TimeUtils.h"
++#include "utils/log.h"
++
++#include <cmath>
++
++namespace kodi::ps4 {
++namespace {
++
++constexpr uint64_t INITIAL_REPEAT_MS = 400;
++constexpr uint64_t REPEAT_MS = 120;
++constexpr float STICK_DEADZONE = 0.6f;
++
++// steady_clock tracks CPU time on Orbis, not wall time; use the same
++// CLOCK_MONOTONIC_RAW source as the rest of the port.
++uint64_t NowMs() {
++  return static_cast<uint64_t>(CurrentHostCounter() / 1000000);
++}
++
++void InjectKey(uint32_t button, bool pressed) {
++  const CKey key(button);
++  CServiceBroker::GetInputManager().QueueKey(key, pressed);
++}
++
++}  // namespace
++
++bool CPadPS4::Initialize() {
++  const bool ok = input_.Initialize();
++  CLog::Log(LOGINFO, "PS4Input: controller subsystem {}", ok ? "ready" : "unavailable");
++  return ok;
++}
++
++void CPadPS4::Emit(uint32_t button, bool pressed, bool& previous) {
++  if (pressed == previous)
++    return;
++  previous = pressed;
++  InjectKey(button, pressed);
++}
++
++void CPadPS4::EmitDirection(bool pressed,
++                            bool& previous,
++                            uint64_t& next_repeat,
++                            uint32_t button,
++                            uint64_t now) {
++  if (pressed) {
++    if (!previous) {
++      previous = true;
++      next_repeat = now + INITIAL_REPEAT_MS;
++      InjectKey(button, true);
++    } else if (now >= next_repeat) {
++      next_repeat = now + REPEAT_MS;
++      InjectKey(button, true);
++    }
++  } else if (previous) {
++    previous = false;
++    InjectKey(button, false);
++  }
++}
++
++void CPadPS4::ReleaseAll(uint64_t now) {
++  EmitDirection(false, up_, next_up_, KEY_BUTTON_DPAD_UP, now);
++  EmitDirection(false, down_, next_down_, KEY_BUTTON_DPAD_DOWN, now);
++  EmitDirection(false, left_, next_left_, KEY_BUTTON_DPAD_LEFT, now);
++  EmitDirection(false, right_, next_right_, KEY_BUTTON_DPAD_RIGHT, now);
++  Emit(KEY_BUTTON_A, false, confirm_);
++  Emit(KEY_BUTTON_B, false, back_);
++  Emit(KEY_BUTTON_START, false, play_pause_);
++  Emit(KEY_BUTTON_WHITE, false, context_menu_);
++  Emit(KEY_BUTTON_LEFT_ANALOG_TRIGGER, false, page_up_);
++  Emit(KEY_BUTTON_RIGHT_ANALOG_TRIGGER, false, page_down_);
++}
++
++void CPadPS4::Poll() {
++  input_.Poll();
++  const PS4InputState state = input_.State();
++  const uint64_t now = NowMs();
++
++  if (!state.connected) {
++    ReleaseAll(now);
++    return;
++  }
++
++  // If the d-pad is used, ignore the stick so a resting stick cannot fight
++  // an explicit direction.  Otherwise use the dominant stick axis with a
++  // deadzone.
++  const bool dpad = state.up || state.down || state.left || state.right;
++  const float ax = std::fabs(state.stick_x);
++  const float ay = std::fabs(state.stick_y);
++  const bool stick_up = !dpad && ay > STICK_DEADZONE && ay >= ax && state.stick_y > 0.0f;
++  const bool stick_down = !dpad && ay > STICK_DEADZONE && ay >= ax && state.stick_y < 0.0f;
++  const bool stick_left = !dpad && ax > STICK_DEADZONE && ax > ay && state.stick_x < 0.0f;
++  const bool stick_right = !dpad && ax > STICK_DEADZONE && ax > ay && state.stick_x > 0.0f;
++
++  EmitDirection(state.up || stick_up, up_, next_up_, KEY_BUTTON_DPAD_UP, now);
++  EmitDirection(state.down || stick_down, down_, next_down_, KEY_BUTTON_DPAD_DOWN, now);
++  EmitDirection(state.left || stick_left, left_, next_left_, KEY_BUTTON_DPAD_LEFT, now);
++  EmitDirection(state.right || stick_right, right_, next_right_, KEY_BUTTON_DPAD_RIGHT, now);
++
++  Emit(KEY_BUTTON_A, state.confirm, confirm_);
++  Emit(KEY_BUTTON_B, state.back, back_);
++  Emit(KEY_BUTTON_START, state.play_pause, play_pause_);
++  Emit(KEY_BUTTON_WHITE, state.context_menu, context_menu_);
++  Emit(KEY_BUTTON_LEFT_ANALOG_TRIGGER, state.page_up, page_up_);
++  Emit(KEY_BUTTON_RIGHT_ANALOG_TRIGGER, state.page_down, page_down_);
++}
++
++void CPadPS4::Shutdown() {
++  ReleaseAll(NowMs());
++  input_.Shutdown();
++}
++
++}  // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/CPadPS4.h b/xbmc/platform/ps4/CPadPS4.h
+new file mode 100644
+index 0000000000..be332ee13b
+--- /dev/null
++++ b/xbmc/platform/ps4/CPadPS4.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include "PS4Input.h"
++
++#include <cstdint>
++
++namespace kodi::ps4 {
++
++class CPadPS4 {
++ public:
++  bool Initialize();
++  void Poll();
++  void Shutdown();
++
++ private:
++  void Emit(uint32_t button, bool pressed, bool& previous);
++  void EmitDirection(bool pressed,
++                     bool& previous,
++                     uint64_t& next_repeat,
++                     uint32_t button,
++                     uint64_t now);
++  void ReleaseAll(uint64_t now);
++
++  PS4Input input_;
++
++  bool up_{false};
++  bool down_{false};
++  bool left_{false};
++  bool right_{false};
++  bool confirm_{false};
++  bool back_{false};
++  bool play_pause_{false};
++  bool context_menu_{false};
++  bool page_up_{false};
++  bool page_down_{false};
++
++  uint64_t next_up_{0};
++  uint64_t next_down_{0};
++  uint64_t next_left_{0};
++  uint64_t next_right_{0};
++};
++
++}  // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/PS4AudioSink.cpp b/xbmc/platform/ps4/PS4AudioSink.cpp
+new file mode 100644
+index 0000000000..ac08128915
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4AudioSink.cpp
+@@ -0,0 +1,190 @@
++#include "PS4AudioSink.h"
++
++#include "utils/log.h"
++
++#if defined(__ORBIS__) || defined(PS4)
++extern "C" {
++#include <orbis/AudioOut.h>
++#include <orbis/libkernel.h>
++}
++#endif
++
++namespace kodi::ps4
++{
++namespace
++{
++constexpr int32_t VOLUME_FLAGS = 0x3; // left and right channel
++
++#if defined(__ORBIS__) || defined(PS4)
++bool g_audio_out_initialized = false;
++#endif
++} // namespace
++
++bool PS4AudioSink::Initialize(uint32_t sample_rate, uint32_t channels, bool float_format)
++{
++  if (sample_rate == 0 || channels == 0 || channels > 2)
++  {
++    CLog::Log(LOGERROR, "PS4 audio: invalid format ({} Hz, {} channels)", sample_rate, channels);
++    return false;
++  }
++
++  sample_rate_ = sample_rate;
++  channels_ = channels;
++  frame_size_ = channels_ * (float_format ? sizeof(float) : sizeof(int16_t));
++  chunk_frames_ = CHUNK_FRAMES;
++  chunk_bytes_ = chunk_frames_ * frame_size_;
++  pending_.clear();
++  pending_offset_ = 0;
++  first_submit_ = true;
++
++#if defined(__ORBIS__) || defined(PS4)
++  if (port_handle_ > 0)
++    return true;
++
++  if (!g_audio_out_initialized)
++  {
++    // libSceAudioOut is not resident; resolve it before the first import.
++    const int loadrc =
++        sceKernelLoadStartModule("libSceAudioOut.sprx", 0, nullptr, 0, nullptr, nullptr);
++    CLog::Log(LOGDEBUG, "PS4 audio: load libSceAudioOut rc=0x{:08x}",
++              static_cast<uint32_t>(loadrc));
++
++    const int initrc = sceAudioOutInit();
++    if (initrc != 0)
++    {
++      CLog::Log(LOGERROR, "PS4 audio: sceAudioOutInit rc=0x{:08x}",
++                static_cast<uint32_t>(initrc));
++      return false;
++    }
++    g_audio_out_initialized = true;
++  }
++
++  uint32_t format;
++  if (float_format)
++    format = channels == 1 ? ORBIS_AUDIO_OUT_PARAM_FORMAT_FLOAT_MONO
++                           : ORBIS_AUDIO_OUT_PARAM_FORMAT_FLOAT_STEREO;
++  else
++    format = channels == 1 ? ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO
++                           : ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO;
++
++  port_handle_ = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM,
++                                 ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, chunk_frames_, sample_rate_,
++                                 format);
++  if (port_handle_ <= 0)
++  {
++    CLog::Log(LOGERROR, "PS4 audio: sceAudioOutOpen rc=0x{:08x}",
++                static_cast<uint32_t>(port_handle_));
++    port_handle_ = 0;
++    return false;
++  }
++
++  CLog::Log(LOGINFO,
++            "PS4 audio: AudioOut handle={} format={} rate={} channels={} chunk={} frames",
++            port_handle_, format, sample_rate_, channels_, chunk_frames_);
++
++  SetVolume(volume_);
++  initialized_ = true;
++  return true;
++#else
++  initialized_ = true;
++  return true;
++#endif
++}
++
++void PS4AudioSink::Submit(const void* pcm, std::size_t bytes)
++{
++  if (!initialized_ || !pcm || bytes == 0 || chunk_bytes_ == 0)
++    return;
++
++  const auto* src = static_cast<const uint8_t*>(pcm);
++  pending_.insert(pending_.end(), src, src + bytes);
++
++  while (pending_.size() - pending_offset_ >= chunk_bytes_)
++  {
++    const uint8_t* chunk = pending_.data() + pending_offset_;
++
++#if defined(__ORBIS__) || defined(PS4)
++    // Wait for the previous buffer before queueing the next one, matching
++    // the OpenOrbis AudioOut sample.
++    const int waitrc = sceAudioOutOutput(port_handle_, nullptr);
++    if (waitrc < 0)
++    {
++      CLog::Log(LOGERROR, "PS4 audio: sceAudioOutOutput(wait) rc=0x{:08x}",
++                static_cast<uint32_t>(waitrc));
++      pending_.clear();
++      pending_offset_ = 0;
++      return;
++    }
++
++    const int rc = sceAudioOutOutput(port_handle_, chunk);
++    if (rc < 0)
++    {
++      CLog::Log(LOGERROR, "PS4 audio: sceAudioOutOutput rc=0x{:08x}",
++                static_cast<uint32_t>(rc));
++      pending_.clear();
++      pending_offset_ = 0;
++      return;
++    }
++    if (first_submit_)
++    {
++      CLog::Log(LOGINFO, "PS4 audio: first output queued ({} bytes/chunk)", chunk_bytes_);
++      first_submit_ = false;
++    }
++#else
++    (void)chunk;
++#endif
++
++    pending_offset_ += chunk_bytes_;
++  }
++
++  if (pending_offset_ > 0)
++  {
++    if (pending_offset_ == pending_.size())
++    {
++      pending_.clear();
++      pending_offset_ = 0;
++    }
++    else if (pending_offset_ >= chunk_bytes_ * 8)
++    {
++      pending_.erase(pending_.begin(), pending_.begin() + pending_offset_);
++      pending_offset_ = 0;
++    }
++  }
++}
++
++void PS4AudioSink::SetVolume(float volume)
++{
++  volume_ = volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume);
++
++#if defined(__ORBIS__) || defined(PS4)
++  if (port_handle_ > 0)
++  {
++    int32_t levels[2] = {static_cast<int32_t>(volume_ * 32768.0f),
++                         static_cast<int32_t>(volume_ * 32768.0f)};
++    const int rc = sceAudioOutSetVolume(port_handle_, VOLUME_FLAGS, levels);
++    if (rc < 0)
++      CLog::Log(LOGERROR, "PS4 audio: sceAudioOutSetVolume rc=0x{:08x}",
++                  static_cast<uint32_t>(rc));
++  }
++#endif
++}
++
++void PS4AudioSink::Shutdown()
++{
++#if defined(__ORBIS__) || defined(PS4)
++  if (port_handle_ > 0)
++  {
++    const int rc = sceAudioOutClose(port_handle_);
++    if (rc < 0)
++      CLog::Log(LOGERROR, "PS4 audio: sceAudioOutClose rc=0x{:08x}",
++                static_cast<uint32_t>(rc));
++    port_handle_ = 0;
++  }
++#endif
++  pending_.clear();
++  pending_offset_ = 0;
++  first_submit_ = true;
++  initialized_ = false;
++}
++
++} // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/PS4AudioSink.h b/xbmc/platform/ps4/PS4AudioSink.h
+new file mode 100644
+index 0000000000..0216c3ff1f
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4AudioSink.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace kodi::ps4
++{
++
++class PS4AudioSink
++{
++public:
++  bool Initialize(uint32_t sample_rate, uint32_t channels, bool float_format);
++  void Submit(const void* pcm, std::size_t bytes);
++  void SetVolume(float volume);
++  void Shutdown();
++
++  uint32_t GetChunkFrames() const { return chunk_frames_; }
++
++private:
++  static constexpr uint32_t CHUNK_FRAMES = 512;
++
++  uint32_t sample_rate_ = 48000;
++  uint32_t channels_ = 2;
++  uint32_t frame_size_ = 4;
++  uint32_t chunk_frames_ = CHUNK_FRAMES;
++  uint32_t chunk_bytes_ = 0;
++  float volume_ = 1.0f;
++  bool initialized_ = false;
++  bool first_submit_ = true;
++  int32_t port_handle_ = 0;
++  std::vector<uint8_t> pending_;
++  std::size_t pending_offset_ = 0;
++};
++
++} // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/PS4Input.cpp b/xbmc/platform/ps4/PS4Input.cpp
+new file mode 100644
+index 0000000000..7f7410bf3d
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4Input.cpp
+@@ -0,0 +1,218 @@
++#include "PS4Input.h"
++
++#include "utils/TimeUtils.h"
++#include "utils/log.h"
++
++#if defined(__ORBIS__) || defined(PS4)
++extern "C" {
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++#include <orbis/libkernel.h>
++}
++
++#ifndef ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL
++#define ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL 16
++#endif
++
++// The PS4 media remote reports its centre button with this bit.
++#ifndef ORBIS_PAD_BUTTON_REMOTE_ENTER
++#define ORBIS_PAD_BUTTON_REMOTE_ENTER 0x80000000u
++#endif
++#endif
++
++namespace kodi::ps4 {
++namespace {
++
++// steady_clock tracks CPU time on Orbis, not wall time; use the same
++// CLOCK_MONOTONIC_RAW source as the rest of the port.
++uint64_t NowMs() {
++  return static_cast<uint64_t>(CurrentHostCounter() / 1000000);
++}
++
++}  // namespace
++
++bool PS4Input::Initialize() {
++  if (initialized_)
++    return true;
++
++#if defined(__ORBIS__) || defined(PS4)
++  // The pad library is a system module.  Load it explicitly for the same
++  // reason as libSceVideoOut: the lazy resolution of the first import can
++  // block in the Kodi process.  Failure here is not fatal (the module may
++  // already be resident).
++  int loadrc = sceKernelLoadStartModule("libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
++  CLog::Log(LOGDEBUG, "PS4Input: load libScePad rc=0x{:08x}", loadrc);
++
++  int initrc = scePadInit();
++  CLog::Log(LOGINFO, "PS4Input: scePadInit rc=0x{:08x}", initrc);
++
++  // libSceUserService is not resident either; load it before the first
++  // import, otherwise the call can terminate the process.
++  int userloadrc =
++      sceKernelLoadStartModule("libSceUserService.sprx", 0, nullptr, 0, nullptr, nullptr);
++  CLog::Log(LOGDEBUG, "PS4Input: load libSceUserService rc=0x{:08x}", userloadrc);
++
++  // scePadOpen() needs the user that launched the application, not the
++  // literal user 0 (that fails with 0x809b0081 when no pad is attached to
++  // user 0).  Resolve it once, as the OpenOrbis input sample does.
++  OrbisUserServiceInitializeParams userparams{};
++  userparams.priority = ORBIS_KERNEL_PRIO_FIFO_LOWEST;
++  int userrc = sceUserServiceInitialize(&userparams);
++  int32_t user = -1;
++  int getrc = sceUserServiceGetInitialUser(&user);
++  if (getrc < 0 || user < 0) {
++    int fgrc = sceUserServiceGetForegroundUser(&user);
++    if (fgrc >= 0)
++      getrc = fgrc;
++  }
++  if (getrc >= 0 && user >= 0)
++    user_id_ = user;
++  else
++    user_id_ = 0;
++  CLog::Log(LOGINFO, "PS4Input: user service rc=0x{:08x} initial rc=0x{:08x}", userrc, getrc);
++
++  TryOpen();
++#endif
++
++  initialized_ = true;
++  return true;
++}
++
++void PS4Input::TryOpen() {
++#if defined(__ORBIS__) || defined(PS4)
++  const uint64_t now = NowMs();
++  if (now < next_open_ms_)
++    return;
++  next_open_ms_ = now + 1000;
++
++  if (handle_ < 0)
++  {
++    handle_ = scePadOpen(user_id_, ORBIS_PAD_PORT_TYPE_STANDARD, 0, nullptr);
++    if (handle_ >= 0)
++      CLog::Log(LOGINFO, "PS4Input: pad opened handle={}", handle_);
++    else
++      CLog::Log(LOGDEBUG, "PS4Input: scePadOpen failed rc=0x{:08x}",
++                static_cast<uint32_t>(handle_));
++  }
++
++  if (remote_handle_ < 0)
++  {
++    remote_handle_ = scePadOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM,
++                                ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL, 0, nullptr);
++    if (remote_handle_ >= 0)
++      CLog::Log(LOGINFO, "PS4Input: media remote opened handle={}", remote_handle_);
++    else
++      CLog::Log(LOGDEBUG, "PS4Input: media remote not present rc=0x{:08x}",
++                static_cast<uint32_t>(remote_handle_));
++  }
++#endif
++}
++
++void PS4Input::Close() {
++#if defined(__ORBIS__) || defined(PS4)
++  if (handle_ >= 0) {
++    scePadClose(handle_);
++    CLog::Log(LOGINFO, "PS4Input: pad closed handle={}", handle_);
++  }
++  if (remote_handle_ >= 0) {
++    scePadClose(remote_handle_);
++    CLog::Log(LOGINFO, "PS4Input: media remote closed handle={}", remote_handle_);
++  }
++#endif
++  handle_ = -1;
++  remote_handle_ = -1;
++  state_ = PS4InputState{};
++}
++
++void PS4Input::Poll() {
++  if (!initialized_)
++    return;
++
++#if defined(__ORBIS__) || defined(PS4)
++  if (handle_ < 0 || remote_handle_ < 0)
++    TryOpen();
++
++  OrbisPadData data{};
++  bool havePad = false;
++  if (handle_ >= 0)
++  {
++    const int rc = scePadReadState(handle_, &data);
++    if (rc < 0)
++    {
++      CLog::Log(LOGINFO, "PS4Input: pad disconnected rc=0x{:08x}",
++                static_cast<uint32_t>(rc));
++      Close();
++    }
++    else if (data.connected != 0)
++    {
++      havePad = true;
++    }
++  }
++
++  OrbisPadData remote{};
++  bool haveRemote = false;
++  if (remote_handle_ >= 0)
++  {
++    const int rc = scePadReadState(remote_handle_, &remote);
++    if (rc < 0)
++    {
++      scePadClose(remote_handle_);
++      remote_handle_ = -1;
++    }
++    else if (remote.connected != 0)
++    {
++      haveRemote = true;
++    }
++  }
++
++  if (!havePad && !haveRemote)
++  {
++    state_ = PS4InputState{};
++    return;
++  }
++
++  const OrbisPadData& src = havePad ? data : remote;
++  PS4InputState state{};
++  state.connected = true;
++
++  const uint32_t buttons = src.buttons;
++  state.up = (buttons & ORBIS_PAD_BUTTON_UP) != 0;
++  state.down = (buttons & ORBIS_PAD_BUTTON_DOWN) != 0;
++  state.left = (buttons & ORBIS_PAD_BUTTON_LEFT) != 0;
++  state.right = (buttons & ORBIS_PAD_BUTTON_RIGHT) != 0;
++  state.confirm = (buttons & ORBIS_PAD_BUTTON_CROSS) != 0;
++  state.back = (buttons & ORBIS_PAD_BUTTON_CIRCLE) != 0;
++  state.play_pause = (buttons & ORBIS_PAD_BUTTON_OPTIONS) != 0;
++  state.context_menu = (buttons & ORBIS_PAD_BUTTON_SQUARE) != 0;
++  state.page_up = (buttons & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_L2)) != 0;
++  state.page_down = (buttons & (ORBIS_PAD_BUTTON_R1 | ORBIS_PAD_BUTTON_R2)) != 0;
++
++  // Merge the media remote regardless of which device provided the primary
++  // data (the remote may report the same navigation bits).
++  if (haveRemote)
++  {
++    const uint32_t remoteButtons = remote.buttons;
++    state.up |= (remoteButtons & ORBIS_PAD_BUTTON_UP) != 0;
++    state.down |= (remoteButtons & ORBIS_PAD_BUTTON_DOWN) != 0;
++    state.left |= (remoteButtons & ORBIS_PAD_BUTTON_LEFT) != 0;
++    state.right |= (remoteButtons & ORBIS_PAD_BUTTON_RIGHT) != 0;
++    state.confirm |= (remoteButtons & ORBIS_PAD_BUTTON_CROSS) != 0;
++    state.confirm |= (remoteButtons & ORBIS_PAD_BUTTON_REMOTE_ENTER) != 0;
++    state.back |= (remoteButtons & ORBIS_PAD_BUTTON_CIRCLE) != 0;
++    state.play_pause |= (remoteButtons & ORBIS_PAD_BUTTON_OPTIONS) != 0;
++  }
++
++  // PS4 sticks are 0..255 with (128,128) at rest.  Normalise to [-1, 1];
++  // Y is inverted because Kodi's screen coordinates grow downwards.
++  state.stick_x = (static_cast<float>(src.leftStick.x) - 128.0f) / 127.0f;
++  state.stick_y = (128.0f - static_cast<float>(src.leftStick.y)) / 127.0f;
++  state_ = state;
++#endif
++}
++
++void PS4Input::Shutdown() {
++  Close();
++  initialized_ = false;
++}
++
++}  // namespace kodi::ps4
+diff --git a/xbmc/platform/ps4/PS4Input.h b/xbmc/platform/ps4/PS4Input.h
+new file mode 100644
+index 0000000000..ed53afae17
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4Input.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <cstdint>
++
++namespace kodi::ps4 {
++
++struct PS4InputState {
++  bool connected = false;
++  bool up = false;
++  bool down = false;
++  bool left = false;
++  bool right = false;
++  bool confirm = false;
++  bool back = false;
++  bool play_pause = false;
++  bool context_menu = false;
++  bool page_up = false;
++  bool page_down = false;
++  float stick_x = 0.0f;
++  float stick_y = 0.0f;
++};
++
++class PS4Input {
++ public:
++  bool Initialize();
++  void Poll();
++  PS4InputState State() const { return state_; }
++  void Shutdown();
++
++ private:
++  void TryOpen();
++  void Close();
++
++  PS4InputState state_{};
++  int32_t handle_ = -1;
++  int32_t remote_handle_ = -1;
++  int32_t user_id_ = -1;
++  uint64_t next_open_ms_ = 0;
++  bool initialized_ = false;
++};
++
++}  // namespace kodi::ps4

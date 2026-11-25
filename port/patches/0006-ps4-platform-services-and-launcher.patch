@@ -1,0 +1,2792 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:37 -0300
+Subject: [PATCH 06/12] ps4: platform services and launcher
+
+Open VideoOut early, set HOME/KODI_HOME, load the network sysmodules, raise the thread stack size, configure the Python runtime and bundled CA bundle, and add the PS4 app launcher builtin.
+---
+ xbmc/application/AppEnvironment.cpp           |   3 +
+ xbmc/application/Application.cpp              |  22 +
+ xbmc/interfaces/builtins/SystemBuiltins.cpp   |  23 +-
+ xbmc/interfaces/python/PythonInvoker.cpp      |   7 +-
+ xbmc/interfaces/python/XBPython.cpp           |  97 +++
+ xbmc/platform/linux/AppParamParserLinux.cpp   |   6 +-
+ xbmc/platform/posix/PosixMountProvider.cpp    |  39 +
+ xbmc/platform/posix/main.cpp                  |  27 +-
+ .../platform/posix/threads/RecursiveMutex.cpp |  30 +-
+ xbmc/platform/ps4/CMakeLists.txt              |  45 ++
+ xbmc/platform/ps4/CPUInfoFreebsd.cpp          | 355 +++++++++
+ xbmc/platform/ps4/CPUInfoFreebsd.h            |  24 +
+ xbmc/platform/ps4/CxaThreadAtexit.cpp         |  65 ++
+ xbmc/platform/ps4/GPUInfoFreebsd.cpp          |  24 +
+ xbmc/platform/ps4/GPUInfoFreebsd.h            |  22 +
+ xbmc/platform/ps4/MemUtils.cpp                | 179 +++++
+ xbmc/platform/ps4/OptionalsReg.cpp            |  29 +
+ xbmc/platform/ps4/OptionalsReg.h              |  18 +
+ xbmc/platform/ps4/PS4HardwareProfile.cpp      | 736 ++++++++++++++++++
+ xbmc/platform/ps4/PS4HardwareProfile.h        | 145 ++++
+ xbmc/platform/ps4/PS4Launcher.cpp             |  59 ++
+ xbmc/platform/ps4/PS4Launcher.h               |  24 +
+ xbmc/platform/ps4/PlatformFreebsd.cpp         | 216 +++++
+ xbmc/platform/ps4/PlatformFreebsd.h           |  26 +
+ xbmc/platform/ps4/PlatformPs4.h               |   4 +
+ xbmc/platform/xbmc.cpp                        |   1 +
+ xbmc/settings/lib/SettingsManager.cpp         |   5 +
+ xbmc/utils/MemUtils.h                         |   9 +
+ xbmc/utils/SystemInfo.cpp                     |  50 +-
+ xbmc/utils/TimeUtils.cpp                      |  13 +
+ 30 files changed, 2288 insertions(+), 15 deletions(-)
+ create mode 100644 xbmc/platform/ps4/CMakeLists.txt
+ create mode 100644 xbmc/platform/ps4/CPUInfoFreebsd.cpp
+ create mode 100644 xbmc/platform/ps4/CPUInfoFreebsd.h
+ create mode 100644 xbmc/platform/ps4/CxaThreadAtexit.cpp
+ create mode 100644 xbmc/platform/ps4/GPUInfoFreebsd.cpp
+ create mode 100644 xbmc/platform/ps4/GPUInfoFreebsd.h
+ create mode 100644 xbmc/platform/ps4/MemUtils.cpp
+ create mode 100644 xbmc/platform/ps4/OptionalsReg.cpp
+ create mode 100644 xbmc/platform/ps4/OptionalsReg.h
+ create mode 100644 xbmc/platform/ps4/PS4HardwareProfile.cpp
+ create mode 100644 xbmc/platform/ps4/PS4HardwareProfile.h
+ create mode 100644 xbmc/platform/ps4/PS4Launcher.cpp
+ create mode 100644 xbmc/platform/ps4/PS4Launcher.h
+ create mode 100644 xbmc/platform/ps4/PlatformFreebsd.cpp
+ create mode 100644 xbmc/platform/ps4/PlatformFreebsd.h
+ create mode 100644 xbmc/platform/ps4/PlatformPs4.h
+
+diff --git a/xbmc/application/AppEnvironment.cpp b/xbmc/application/AppEnvironment.cpp
+index c5020fa154..45f157e72b 100644
+--- a/xbmc/application/AppEnvironment.cpp
++++ b/xbmc/application/AppEnvironment.cpp
+@@ -16,11 +16,14 @@
+ void CAppEnvironment::SetUp(const std::shared_ptr<CAppParams>& appParams)
+ {
+   CServiceBroker::RegisterAppParams(appParams);
++
+   CServiceBroker::CreateLogging();
++
+   CServiceBroker::RegisterResourcesComponent(std::make_unique<CResourcesComponent>());
+ 
+   const auto settingsComponent = std::make_shared<CSettingsComponent>();
+   settingsComponent->Initialize();
++
+   CServiceBroker::RegisterSettingsComponent(settingsComponent);
+ }
+ 
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 28b48ffe8d..566ad1c04d 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -168,6 +168,9 @@
+ #include "platform/posix/PlatformPosix.h"
+ #include "platform/posix/XHandle.h"
+ #endif
++#if defined(TARGET_PS4)
++#include "platform/ps4/CPadPS4.h"
++#endif
+ #if defined(TARGET_POSIX) && defined(HAS_FILESYSTEM_SMB)
+ #include "platform/posix/filesystem/SMBFile.h"
+ #endif
+@@ -301,6 +304,7 @@ bool CApplication::Create()
+   CUtil::CopyUserDataIfNeeded("special://masterprofile/", "favourites.xml");
+   CUtil::CopyUserDataIfNeeded("special://masterprofile/", "Lircmap.xml");
+ 
++  CDirectory::Create("special://logpath");
+   CServiceBroker::GetLogging().Initialize(CSpecialProtocol::TranslatePath("special://logpath"));
+ 
+ #ifdef TARGET_POSIX //! @todo Win32 has no special://home/ mapping by default, so we
+@@ -384,6 +388,16 @@ bool CApplication::Create()
+   // set user defined CA trust bundle
+   std::string caCert =
+       CSpecialProtocol::TranslatePath(settingsComponent->GetAdvancedSettings()->m_caTrustFile);
++#if defined(TARGET_PS4)
++  // Orbis has no system CA store.  FFmpeg/OpenSSL uses the default verify
++  // paths, so point it at the bundle Kodi already ships.
++  if (caCert.empty())
++  {
++    caCert = CSpecialProtocol::TranslatePath("special://xbmc/system/certs/cacert.pem");
++    if (XFILE::CFile::Exists(caCert))
++      CLog::Log(LOGINFO, "PS4: SSL_CERT_FILE (bundled) -> {}", caCert);
++  }
++#endif
+   if (!caCert.empty())
+   {
+     if (XFILE::CFile::Exists(caCert))
+@@ -1570,6 +1584,14 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+     }
+ 
+     m_pMsgHandling->HandleEvents();
++#if defined(TARGET_PS4)
++    // Poll the DualShock 4 on the main thread and inject its edges as keys,
++    // so InputManager::Process() handles them like a remote.
++    static kodi::ps4::CPadPS4 pad;
++    static const bool padReady = pad.Initialize();
++    if (padReady)
++      pad.Poll();
++#endif
+     CServiceBroker::GetInputManager().Process(CServiceBroker::GetGUI()->GetWindowManager().GetActiveWindowOrDialog(), frameTime);
+ 
+     if (processGUI && renderGUI)
+diff --git a/xbmc/interfaces/builtins/SystemBuiltins.cpp b/xbmc/interfaces/builtins/SystemBuiltins.cpp
+index a18e3a360e..3e4193d4d1 100644
+--- a/xbmc/interfaces/builtins/SystemBuiltins.cpp
++++ b/xbmc/interfaces/builtins/SystemBuiltins.cpp
+@@ -12,6 +12,22 @@
+ #include "messaging/ApplicationMessenger.h"
+ #include "utils/StringUtils.h"
+ 
++#if defined(__ORBIS__)
++#include "platform/ps4/PS4Launcher.h"
++
++/*! \brief Launch an installed PS4 application.
++ *  \param params The parameters.
++ *  \details params[0] = The nine-character PS4 title id.
++ */
++static int LaunchPS4App(const std::vector<std::string>& params)
++{
++  if (params.empty())
++    return -1;
++
++  return KODI::PLATFORM::PS4::LaunchApp(params[0]) ? 0 : -1;
++}
++#endif
++
+ /*! \brief Execute a system executable.
+  *  \param params The parameters.
+  *  \details params[0] = The path to the executable.
+@@ -269,5 +285,10 @@ CBuiltins::CommandMap CSystemBuiltins::GetOperations() const
+           {"suspend", {"Suspends the system", 0, Suspend}},
+           {"system.exec", {"Execute shell commands", 1, Exec<0>}},
+           {"system.execwait",
+-           {"Execute shell commands and freezes Kodi until shell is closed", 1, Exec<1>}}};
++           {"Execute shell commands and freezes Kodi until shell is closed", 1, Exec<1>}}
++#if defined(__ORBIS__)
++          ,
++          {"launchps4app", {"Launch a PS4 application by title id", 1, LaunchPS4App}}
++#endif
++  };
+ }
+diff --git a/xbmc/interfaces/python/PythonInvoker.cpp b/xbmc/interfaces/python/PythonInvoker.cpp
+index ef608a4b86..49a331ed71 100644
+--- a/xbmc/interfaces/python/PythonInvoker.cpp
++++ b/xbmc/interfaces/python/PythonInvoker.cpp
+@@ -265,6 +265,7 @@ bool CPythonInvoker::execute(const std::string& script, std::vector<std::wstring
+       std::unique_lock lockMe(m_critical);
+       m_threadState = l_threadState;
+     }
++
+   }
+   else
+     // swap in my thread m_threadState
+@@ -279,7 +280,11 @@ bool CPythonInvoker::execute(const std::string& script, std::vector<std::wstring
+ 
+   for (const auto& arg : arguments)
+   {
+-    PyObject* pyArg = PyUnicode_FromWideChar(arg.c_str(), arg.length());
++    // CPython is built with 2-byte wchar_t on PS4 while Kodi's C++ uses
++    // 4-byte wchar_t; passing the wide string directly corrupts sys.argv.
++    std::string utf8Arg;
++    g_charsetConverter.wToUTF8(arg, utf8Arg, false);
++    PyObject* pyArg = PyUnicode_FromStringAndSize(utf8Arg.c_str(), utf8Arg.size());
+     PyList_Append(sysArgv, pyArg);
+     CLog::Log(LOGDEBUG, "CPythonInvoker({}):  {}", GetId(), PyUnicode_AsUTF8(pyArg));
+ 
+diff --git a/xbmc/interfaces/python/XBPython.cpp b/xbmc/interfaces/python/XBPython.cpp
+index 21af8ccece..24cd0104ca 100644
+--- a/xbmc/interfaces/python/XBPython.cpp
++++ b/xbmc/interfaces/python/XBPython.cpp
+@@ -45,6 +45,7 @@ XBPython::XBPython()
+ #if defined(TARGET_DARWIN) || defined(TARGET_LINUX)
+   setenv("PYTHONOPTIMIZE", "1", 1);
+ #endif
++
+   // Info about interesting python envvars available
+   // at http://docs.python.org/using/cmdline.html#environment-variables
+ 
+@@ -62,6 +63,25 @@ XBPython::XBPython()
+   }
+ #endif
+ 
++#if defined(__ORBIS__)
++  // CPython is linked statically.  Its getpath() cannot find a host prefix
++  // inside the PS4 sandbox, so point it at the stdlib shipped in the PKG.
++  const auto pythonRootPath =
++      CSpecialProtocol::TranslatePath("special://xbmc/system/python");
++  const auto pythonLibPath = pythonRootPath + "/lib/python3.14";
++  const auto caBundle =
++      CSpecialProtocol::TranslatePath("special://xbmc/system/certs/cacert.pem");
++  setenv("PYTHONHOME", pythonRootPath.c_str(), 1);
++  setenv("PYTHONPATH", pythonLibPath.c_str(), 1);
++  // Python's ssl module uses OpenSSL's default paths, which do not exist in
++  // the PS4 sandbox.  Point it at the same bundle libcurl already uses.
++  setenv("SSL_CERT_FILE", caBundle.c_str(), 1);
++  setenv("REQUESTS_CA_BUNDLE", caBundle.c_str(), 1);
++  setenv("CURL_CA_BUNDLE", caBundle.c_str(), 1);
++  CLog::Log(LOGINFO, "PS4 python: PYTHONHOME={} PYTHONPATH={} CA={}", pythonRootPath,
++            pythonLibPath, caBundle);
++#endif
++
+   // *::GlobalInitializeModules() functions call PyImport_ExtendInittab(). PyImport_ExtendInittab() should
+   // be called before Py_Initialize() as required by the Python documentation.
+   CAddonPythonInvoker::GlobalInitializeModules();
+@@ -70,7 +90,84 @@ XBPython::XBPython()
+   CHTTPPythonWsgiInvoker::GlobalInitializeModules();
+ #endif
+ 
++#if defined(__ORBIS__)
++  // Keep CPython away from the host locale, stdio and signal handlers.  The
++  // Orbis libc has partial locale/signal support and the default
++  // Py_Initialize() path can fault during pre-configuration.
++  /* Python 3.14 uses mimalloc by default; its arena reservations put extra
++   * pressure on the PS4 flexible-memory budget.  Use the libc allocator so
++   * Python shares Kodi's accounting and does not reserve large arenas. */
++  setenv("PYTHONMALLOC", "malloc", 1);
++
++  PyPreConfig preConfig;
++  PyPreConfig_InitPythonConfig(&preConfig);
++  preConfig.configure_locale = 0;
++  preConfig.utf8_mode = 1;
++  PyStatus status = Py_PreInitialize(&preConfig);
++  if (PyStatus_Exception(status))
++  {
++    char msg[512];
++    snprintf(msg, sizeof(msg), "python-preinit-fail:%s",
++             status.err_msg ? status.err_msg : "unknown");
++    CLog::Log(LOGFATAL, "PS4 python: preinit failed: {}",
++              status.err_msg ? status.err_msg : "unknown");
++    m_bindingModulesLoaded = false;
++    return;
++  }
++
++  PyConfig config;
++  PyConfig_InitPythonConfig(&config);
++  config.parse_argv = 0;
++  config.install_signal_handlers = 0;
++  config.configure_c_stdio = 0;
++  /* Let CPython cache .pyc for add-ons installed in the writable profile.
++   * System add-ons under /app0 are read-only and simply skip the write;
++   * cached bytecode removes parse/compile time from every plugin start. */
++  config.write_bytecode = 1;
++
++  // getpath must not depend on argv[0] or the current directory: the PS4
++  // sandbox can start Kodi with an unusable cwd, and a getcwd() failure
++  // makes Py_InitializeFromConfig fail with "error evaluating path".
++  const std::string appExecutable = "/app0/eboot.bin";
++  const auto setConfigString = [&](const char* name, wchar_t** field,
++                                   const std::string& value) {
++    PyStatus s = PyConfig_SetBytesString(&config, field, value.c_str());
++    if (PyStatus_Exception(s))
++    {
++      char msg[512];
++      snprintf(msg, sizeof(msg), "python-config-fail:%s:%s", name,
++               s.err_msg ? s.err_msg : "unknown");
++      CLog::Log(LOGFATAL, "PS4 python: config {} failed: {}", name,
++                s.err_msg ? s.err_msg : "unknown");
++      return false;
++    }
++    return true;
++  };
++  if (!setConfigString("home", &config.home, pythonRootPath) ||
++      !setConfigString("program_name", &config.program_name, appExecutable) ||
++      !setConfigString("executable", &config.executable, appExecutable) ||
++      !setConfigString("base_executable", &config.base_executable, appExecutable))
++  {
++    PyConfig_Clear(&config);
++    m_bindingModulesLoaded = false;
++    return;
++  }
++
++  status = Py_InitializeFromConfig(&config);
++  PyConfig_Clear(&config);
++  if (PyStatus_Exception(status))
++  {
++    char msg[512];
++    snprintf(msg, sizeof(msg), "python-init-fail:%s",
++             status.err_msg ? status.err_msg : "unknown");
++    CLog::Log(LOGFATAL, "PS4 python: init failed: {}",
++              status.err_msg ? status.err_msg : "unknown");
++    m_bindingModulesLoaded = false;
++    return;
++  }
++#else
+   Py_Initialize();
++#endif
+ 
+   // a module adopts types shared with the others only on its first init, so
+   // init them together here rather than in whichever sub-interpreter a script
+diff --git a/xbmc/platform/linux/AppParamParserLinux.cpp b/xbmc/platform/linux/AppParamParserLinux.cpp
+index 62c43f4da8..71927b38ec 100644
+--- a/xbmc/platform/linux/AppParamParserLinux.cpp
++++ b/xbmc/platform/linux/AppParamParserLinux.cpp
+@@ -75,7 +75,7 @@ void CAppParamParserLinux::ParseArg(const std::string& arg)
+ 
+   if (arg.substr(0, 12) == "--windowing=")
+   {
+-    if (std::ranges::find(availableWindowSystems, arg.substr(12)) != availableWindowSystems.end())
++    if (std::find(availableWindowSystems.begin(), availableWindowSystems.end(), arg.substr(12)) != availableWindowSystems.end())
+       GetAppParams()->SetWindowing(arg.substr(12));
+     else
+     {
+@@ -86,7 +86,7 @@ void CAppParamParserLinux::ParseArg(const std::string& arg)
+   }
+   else if (arg.substr(0, 10) == "--logging=")
+   {
+-    if (std::ranges::find(availableLogTargets, arg.substr(10)) != availableLogTargets.end())
++    if (std::find(availableLogTargets.begin(), availableLogTargets.end(), arg.substr(10)) != availableLogTargets.end())
+     {
+       GetAppParams()->SetLogTarget(arg.substr(10));
+     }
+@@ -117,7 +117,7 @@ void CAppParamParserLinux::ParseArg(const std::string& arg)
+   else if (arg.find("--gl-interface=") != std::string::npos)
+   {
+     const auto argValue = arg.substr(15);
+-    const auto it = std::ranges::find(availableGlInterfaces, argValue);
++    const auto it = std::find(availableGlInterfaces.begin(), availableGlInterfaces.end(), argValue);
+     if (it != availableGlInterfaces.cend())
+     {
+       GetAppParams()->SetGlInterface(argValue);
+diff --git a/xbmc/platform/posix/PosixMountProvider.cpp b/xbmc/platform/posix/PosixMountProvider.cpp
+index 6f1c3a23d3..1e016be363 100644
+--- a/xbmc/platform/posix/PosixMountProvider.cpp
++++ b/xbmc/platform/posix/PosixMountProvider.cpp
+@@ -15,6 +15,41 @@
+ 
+ #include <cstdlib>
+ 
++#if defined(__ORBIS__)
++#include <cinttypes>
++#include <cstdio>
++#include <sys/statvfs.h>
++
++namespace
++{
++std::vector<std::string> GetPS4DiskUsage()
++{
++  // The Orbis sandbox only exposes /user to the application.  Do not probe
++  // /data or / here: statvfs on those paths can fault on some firmwares
++  // (CE-34878 when opening System Info).  If /user is not available, report
++  // no storage instead of risking a crash.
++  struct statvfs vfs = {};
++  const int rc = statvfs("/user", &vfs);
++  CLog::Log(LOGINFO,
++            "PS4 storage: /user statvfs rc={} bsize={} frsize={} blocks={} bfree={} bavail={}",
++            rc, vfs.f_bsize, vfs.f_frsize, vfs.f_blocks, vfs.f_bfree, vfs.f_bavail);
++  if (rc != 0)
++    return {};
++
++  const uint64_t unit = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
++  const uint64_t total = static_cast<uint64_t>(vfs.f_blocks) * unit;
++  const uint64_t avail = static_cast<uint64_t>(vfs.f_bavail) * unit;
++  if (unit == 0 || total < 100ULL * 1024ULL * 1024ULL)
++    return {};
++
++  char line[160];
++  snprintf(line, sizeof(line), "/user  %.1f GB total  %.1f GB free",
++           total / (1024.0 * 1024.0 * 1024.0), avail / (1024.0 * 1024.0 * 1024.0));
++  return {line};
++}
++} // namespace
++#endif
++
+ CPosixMountProvider::CPosixMountProvider()
+ {
+   m_removableLength = 0;
+@@ -84,6 +119,9 @@ void CPosixMountProvider::GetDrives(std::vector<CMediaSource>& drives)
+ 
+ std::vector<std::string> CPosixMountProvider::GetDiskUsage()
+ {
++#if defined(__ORBIS__)
++  return GetPS4DiskUsage();
++#else
+   std::vector<std::string> result;
+   char line[1024];
+ 
+@@ -117,6 +155,7 @@ std::vector<std::string> CPosixMountProvider::GetDiskUsage()
+   }
+ 
+   return result;
++#endif
+ }
+ 
+ bool CPosixMountProvider::Eject(const std::string& mountpath)
+diff --git a/xbmc/platform/posix/main.cpp b/xbmc/platform/posix/main.cpp
+index 2032d93290..7ea4059c6f 100644
+--- a/xbmc/platform/posix/main.cpp
++++ b/xbmc/platform/posix/main.cpp
+@@ -27,6 +27,11 @@
+ 
+ #include <sys/resource.h>
+ 
++#if defined(TARGET_PS4)
++extern "C" void PS4_EarlyVideoOutInit(void);
++#include "platform/ps4/PlatformPs4.h"
++#endif
++
+ namespace
+ {
+ extern "C" void XBMC_POSIX_HandleSignal(int sig)
+@@ -39,6 +44,20 @@ extern "C" void XBMC_POSIX_HandleSignal(int sig)
+ 
+ int main(int argc, char* argv[])
+ {
++
++#if defined(TARGET_PS4)
++  // Open VideoOut before the rest of Kodi initializes: on this firmware a
++  // late sceVideoOutOpen blocks forever, while the same call at main entry
++  // (as the standalone GNM test does) succeeds.
++  PS4_EarlyVideoOutInit();
++#endif
++
++#if defined(TARGET_PS4)
++  // The PS4 needs HOME and KODI_HOME before Kodi resolves the directories
++  // of the profile, which happens before the platform is initialised.
++  PreparePS4Environment();
++#endif
++
+ #if defined(_DEBUG)
+   struct rlimit rlim;
+   rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
+@@ -67,8 +86,14 @@ int main(int argc, char* argv[])
+   appParamParser.Parse(argv, argc);
+ 
+   CAppEnvironment::SetUp(appParamParser.GetAppParams());
++
+   int status = XBMC_Run(true);
+-  CAppEnvironment::TearDown();
++  /* A failed Create() leaves services only partially initialised; the
++   * settings/environment teardown can then dereference a null object (the
++   * initial CE-34878-0 path).  Nothing needs tearing down when startup
++   * failed, so skip it and let the process exit with the error status. */
++  if (status != -1)
++    CAppEnvironment::TearDown();
+ 
+   return status;
+ }
+diff --git a/xbmc/platform/posix/threads/RecursiveMutex.cpp b/xbmc/platform/posix/threads/RecursiveMutex.cpp
+index 19a940e518..872346bb8d 100644
+--- a/xbmc/platform/posix/threads/RecursiveMutex.cpp
++++ b/xbmc/platform/posix/threads/RecursiveMutex.cpp
+@@ -8,23 +8,37 @@
+ 
+ #include "RecursiveMutex.h"
+ 
++
+ namespace XbmcThreads
+ {
+ 
++namespace
++{
++// PS4's pthread_mutexattr_t is a pointer-sized handle, but the OpenOrbis
++// header declares it as a 4-byte struct.  Keep the full 8 bytes and
++// initialize it in place so the handle is not truncated by a by-value copy.
++struct RecursiveMutexAttrStorage
++{
++  alignas(8) unsigned char data[8];
++};
++} // namespace
++
+ pthread_mutexattr_t& CRecursiveMutex::getRecursiveAttr()
+ {
+-  static pthread_mutexattr_t recursiveAttr = []()
++  static RecursiveMutexAttrStorage storage;
++  static const bool initialized = []()
+   {
+-    pthread_mutexattr_t recursiveAttr;
+-    pthread_mutexattr_init(&recursiveAttr);
+-    pthread_mutexattr_settype(&recursiveAttr, PTHREAD_MUTEX_RECURSIVE);
+-#if !defined(TARGET_ANDROID)
+-    pthread_mutexattr_setprotocol(&recursiveAttr, PTHREAD_PRIO_INHERIT);
++    auto* attr = reinterpret_cast<pthread_mutexattr_t*>(storage.data);
++    pthread_mutexattr_init(attr);
++    pthread_mutexattr_settype(attr, PTHREAD_MUTEX_RECURSIVE);
++#if !defined(TARGET_ANDROID) && !defined(TARGET_PS4)
++    pthread_mutexattr_setprotocol(attr, PTHREAD_PRIO_INHERIT);
+ #endif
+-    return recursiveAttr;
++    return true;
+   }();
++  (void)initialized;
+ 
+-  return recursiveAttr;
++  return *reinterpret_cast<pthread_mutexattr_t*>(storage.data);
+ }
+ 
+ } // namespace XbmcThreads
+diff --git a/xbmc/platform/ps4/CMakeLists.txt b/xbmc/platform/ps4/CMakeLists.txt
+new file mode 100644
+index 0000000000..a5e3e2887a
+--- /dev/null
++++ b/xbmc/platform/ps4/CMakeLists.txt
+@@ -0,0 +1,45 @@
++set(SOURCES ../linux/AppParamParserLinux.cpp
++            CPUInfoFreebsd.cpp
++            CxaThreadAtexit.cpp
++            GPUInfoFreebsd.cpp
++            OptionalsReg.cpp
++            ../linux/OptionalsReg.cpp
++            ../linux/TimeUtils.cpp
++            MemUtils.cpp
++            PlatformFreebsd.cpp
++            PS4HardwareProfile.cpp
++            PS4Launcher.cpp
++            PS4ShaderBin.cpp
++            PS4AudioSink.cpp
++            PS4Input.cpp
++            CPadPS4.cpp
++            CAESinkPS4.cpp)
++
++set(HEADERS ../linux/AppParamParserLinux.cpp
++            CPUInfoFreebsd.h
++            GPUInfoFreebsd.h
++            OptionalsReg.h
++            ../linux/OptionalsReg.h
++            ../linux/TimeUtils.h
++            PlatformFreebsd.h
++            PS4HardwareProfile.h
++            PS4Launcher.h
++            PS4ShaderBin.h
++            PS4AudioSink.h
++            PS4Input.h
++            CPadPS4.h
++            CAESinkPS4.h)
++
++if(TARGET ${APP_NAME_LC}::Alsa)
++  list(APPEND SOURCES ../linux/FDEventMonitor.cpp)
++  list(APPEND HEADERS ../linux/FDEventMonitor.h)
++endif()
++
++if(TARGET ${APP_NAME_LC}::DBus)
++  list(APPEND SOURCES ../linux/DBusMessage.cpp
++                      ../linux/DBusUtil.cpp)
++  list(APPEND HEADERS ../linux/DBusMessage.h
++                      ../linux/DBusUtil.h)
++endif()
++
++core_add_library(ps4support)
+diff --git a/xbmc/platform/ps4/CPUInfoFreebsd.cpp b/xbmc/platform/ps4/CPUInfoFreebsd.cpp
+new file mode 100644
+index 0000000000..9f40c0bcdd
+--- /dev/null
++++ b/xbmc/platform/ps4/CPUInfoFreebsd.cpp
+@@ -0,0 +1,355 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "CPUInfoFreebsd.h"
++
++#include "utils/Temperature.h"
++#include "utils/log.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <vector>
++
++#if defined(__ORBIS__)
++#include <orbis/libkernel.h>
++
++extern "C" int32_t sceKernelGetCpuTemperature(uint64_t* temperature);
++#endif
++
++// clang-format off
++/* sys/types.h must be included early, esp. before sysy/systl.h, otherwise:
++   /usr/include/sys/sysctl.h:1117:25: error: unknown type name 'u_int' */
++
++#include <sys/types.h>
++// clang-format on
++
++#if defined(__i386__) || defined(__x86_64__)
++#include <cpuid.h>
++#elif __has_include(<sys/auxv.h>)
++#include <sys/auxv.h>
++#endif
++
++#include <sys/resource.h>
++#if !defined(__ORBIS__)
++#include <sys/sysctl.h>
++#endif
++
++#if !defined(__ORBIS__)
++namespace
++{
++
++struct CpuData
++{
++public:
++  std::size_t GetActiveTime() const { return state[CP_USER] + state[CP_NICE] + state[CP_SYS]; }
++
++  std::size_t GetIdleTime() const { return state[CP_INTR] + state[CP_IDLE]; }
++
++  std::size_t GetTotalTime() const { return GetActiveTime() + GetIdleTime(); }
++
++  std::size_t state[CPUSTATES];
++};
++
++} // namespace
++#endif
++
++std::shared_ptr<CCPUInfo> CCPUInfo::GetCPUInfo()
++{
++  return std::make_shared<CCPUInfoFreebsd>();
++}
++
++CCPUInfoFreebsd::CCPUInfoFreebsd()
++{
++#if defined(__ORBIS__)
++  m_cpuCount = 8;
++#else
++  int count = 0;
++  size_t countLength = sizeof(count);
++  if (sysctlbyname("hw.ncpu", &count, &countLength, nullptr, 0) == 0)
++    m_cpuCount = count;
++  else
++    m_cpuCount = 1;
++
++  std::array<char, 512> cpuModel;
++  size_t length = cpuModel.size();
++  if (sysctlbyname("hw.model", cpuModel.data(), &length, nullptr, 0) == 0)
++    m_cpuModel = cpuModel.data();
++#endif
++
++  for (int i = 0; i < m_cpuCount; i++)
++  {
++    CoreInfo core;
++    core.m_id = i;
++    m_cores.emplace_back(core);
++  }
++#if defined(__i386__) || defined(__x86_64__)
++  uint32_t eax, ebx, ecx, edx;
++
++  m_cpuVendor.clear();
++
++  if (__get_cpuid(CPUID_INFOTYPE_MANUFACTURER, &eax, &ebx, &ecx, &edx))
++  {
++    m_cpuVendor.append(reinterpret_cast<const char*>(&ebx), 4);
++    m_cpuVendor.append(reinterpret_cast<const char*>(&edx), 4);
++    m_cpuVendor.append(reinterpret_cast<const char*>(&ecx), 4);
++  }
++
++  if (__get_cpuid(CPUID_INFOTYPE_EXTENDED_IMPLEMENTED, &eax, &ebx, &ecx, &edx))
++  {
++    if (eax >= CPUID_INFOTYPE_PROCESSOR_3)
++    {
++      m_cpuModel.clear();
++
++      if (__get_cpuid(CPUID_INFOTYPE_PROCESSOR_1, &eax, &ebx, &ecx, &edx))
++      {
++        m_cpuModel.append(reinterpret_cast<const char*>(&eax), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ebx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ecx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&edx), 4);
++      }
++
++      if (__get_cpuid(CPUID_INFOTYPE_PROCESSOR_2, &eax, &ebx, &ecx, &edx))
++      {
++        m_cpuModel.append(reinterpret_cast<const char*>(&eax), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ebx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ecx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&edx), 4);
++      }
++
++      if (__get_cpuid(CPUID_INFOTYPE_PROCESSOR_3, &eax, &ebx, &ecx, &edx))
++      {
++        m_cpuModel.append(reinterpret_cast<const char*>(&eax), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ebx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&ecx), 4);
++        m_cpuModel.append(reinterpret_cast<const char*>(&edx), 4);
++      }
++    }
++  }
++
++  m_cpuModel = m_cpuModel.substr(0, m_cpuModel.find(char(0))); // remove extra null terminations
++
++  if (__get_cpuid(CPUID_INFOTYPE_STANDARD, &eax, &eax, &ecx, &edx))
++  {
++    if (edx & CPUID_00000001_EDX_MMX)
++      m_cpuFeatures |= CPU_FEATURE_MMX;
++
++    // Set MMX2 when SSE is present as SSE is a superset of MMX2 and Intel doesn't set the MMX2 cap
++    if (edx & CPUID_00000001_EDX_SSE)
++      m_cpuFeatures |= (CPU_FEATURE_SSE | CPU_FEATURE_MMX2);
++
++    if (edx & CPUID_00000001_EDX_SSE2)
++      m_cpuFeatures |= CPU_FEATURE_SSE2;
++
++    if (ecx & CPUID_00000001_ECX_SSE3)
++      m_cpuFeatures |= CPU_FEATURE_SSE3;
++
++    if (ecx & CPUID_00000001_ECX_SSSE3)
++      m_cpuFeatures |= CPU_FEATURE_SSSE3;
++
++    if (ecx & CPUID_00000001_ECX_SSE4)
++      m_cpuFeatures |= CPU_FEATURE_SSE4;
++
++    if (ecx & CPUID_00000001_ECX_SSE42)
++      m_cpuFeatures |= CPU_FEATURE_SSE42;
++  }
++
++  if (__get_cpuid(CPUID_INFOTYPE_EXTENDED_IMPLEMENTED, &eax, &eax, &ecx, &edx))
++  {
++    if (eax >= CPUID_INFOTYPE_EXTENDED)
++    {
++      if (edx & CPUID_80000001_EDX_MMX)
++        m_cpuFeatures |= CPU_FEATURE_MMX;
++
++      if (edx & CPUID_80000001_EDX_MMX2)
++        m_cpuFeatures |= CPU_FEATURE_MMX2;
++
++      if (edx & CPUID_80000001_EDX_3DNOW)
++        m_cpuFeatures |= CPU_FEATURE_3DNOW;
++
++      if (edx & CPUID_80000001_EDX_3DNOWEXT)
++        m_cpuFeatures |= CPU_FEATURE_3DNOWEXT;
++    }
++  }
++
++#if defined(__ORBIS__)
++  // Jaguar supports SSE4.2/AVX/BMI1/AES/F16C.  Kodi's feature enum has no
++  // AVX bit, so log the raw CPUID state; it tells us whether -march=btver2
++  // is safe and whether the OS enabled the AVX state (OSXSAVE).
++  if (__get_cpuid(CPUID_INFOTYPE_STANDARD, &eax, &ebx, &ecx, &edx))
++  {
++    CLog::Log(LOGINFO,
++              "PS4 CPU: SSE4.2={} AVX={} XSAVE={} OSXSAVE={} BMI1={} F16C={} AES={}",
++              (ecx & CPUID_00000001_ECX_SSE42) ? 1 : 0, (ecx & bit_AVX) ? 1 : 0,
++              (ecx & bit_XSAVE) ? 1 : 0, (ecx & bit_OSXSAVE) ? 1 : 0,
++              (ebx & bit_BMI) ? 1 : 0, (ecx & bit_F16C) ? 1 : 0,
++              (ecx & bit_AES) ? 1 : 0);
++  }
++#endif
++#endif
++
++#if defined(HAS_NEON)
++#if defined(__ARM_NEON)
++  m_cpuFeatures |= CPU_FEATURE_NEON;
++#elif __has_include(<sys/auxv.h>)
++  unsigned long hwcap = 0;
++  elf_aux_info(AT_HWCAP, &hwcap, sizeof(hwcap));
++  if (hwcap & HWCAP_NEON)
++    m_cpuFeatures |= CPU_FEATURE_NEON;
++#endif
++#endif
++}
++
++int CCPUInfoFreebsd::GetUsedPercentage()
++{
++#if defined(__ORBIS__)
++  if (!m_nextUsedReadTime.IsTimePast())
++    return m_lastUsedPercentage;
++
++  struct rusage usage = {};
++  if (getrusage(RUSAGE_SELF, &usage) != 0)
++    return m_lastUsedPercentage;
++
++  const uint64_t processUs =
++      (static_cast<uint64_t>(usage.ru_utime.tv_sec) + usage.ru_stime.tv_sec) * 1000000ULL +
++      usage.ru_utime.tv_usec + usage.ru_stime.tv_usec;
++  const uint64_t wallUs = sceKernelGetProcessTime();
++
++  static uint64_t lastProcessUs = 0;
++  static uint64_t lastWallUs = 0;
++  if (lastWallUs != 0 && wallUs > lastWallUs)
++  {
++    const double cpuDelta = static_cast<double>(processUs - lastProcessUs);
++    const double wallDelta = static_cast<double>(wallUs - lastWallUs);
++    const double cores = m_cpuCount > 0 ? m_cpuCount : 1;
++    m_lastUsedPercentage = static_cast<int>(
++        std::clamp(cpuDelta * 100.0 / (wallDelta * cores), 0.0, 100.0));
++
++    // Orbis only exposes process CPU time, not per-core counters.  Report the
++    // same average on every core so the System Info screen shows live data.
++    for (auto& core : m_cores)
++      core.m_usagePercent = m_lastUsedPercentage;
++  }
++
++  lastProcessUs = processUs;
++  lastWallUs = wallUs;
++  m_nextUsedReadTime.Set(MINIMUM_TIME_BETWEEN_READS);
++  return m_lastUsedPercentage;
++#else
++  if (!m_nextUsedReadTime.IsTimePast())
++    return m_lastUsedPercentage;
++
++  size_t len = sizeof(long);
++
++  if (sysctlbyname("kern.cp_times", nullptr, &len, nullptr, 0) != 0)
++    return false;
++
++  std::vector<long> cptimes(len);
++  size_t cptimesLength = cptimes.size();
++  if (sysctlbyname("kern.cp_times", cptimes.data(), &cptimesLength, nullptr, 0) != 0)
++    return false;
++
++  size_t activeTime{0};
++  size_t idleTime{0};
++  size_t totalTime{0};
++
++  std::vector<CpuData> cpuData;
++
++  for (int i = 0; i < m_cpuCount; i++)
++  {
++    CpuData info;
++
++    for (size_t state = 0; state < CPUSTATES; state++)
++    {
++      info.state[state] = cptimes[i * CPUSTATES + state];
++    }
++
++    activeTime += info.GetActiveTime();
++    idleTime += info.GetIdleTime();
++    totalTime += info.GetTotalTime();
++
++    cpuData.emplace_back(info);
++  }
++
++  activeTime -= m_activeTime;
++  idleTime -= m_idleTime;
++  totalTime -= m_totalTime;
++
++  m_activeTime += activeTime;
++  m_idleTime += idleTime;
++  m_totalTime += totalTime;
++
++  m_lastUsedPercentage = activeTime * 100.0f / totalTime;
++  m_nextUsedReadTime.Set(MINIMUM_TIME_BETWEEN_READS);
++
++  for (size_t core = 0; core < cpuData.size(); core++)
++  {
++    auto activeTime = cpuData[core].GetActiveTime() - m_cores[core].m_activeTime;
++    auto idleTime = cpuData[core].GetIdleTime() - m_cores[core].m_idleTime;
++    auto totalTime = cpuData[core].GetTotalTime() - m_cores[core].m_totalTime;
++
++    m_cores[core].m_usagePercent = activeTime * 100.0 / totalTime;
++
++    m_cores[core].m_activeTime += activeTime;
++    m_cores[core].m_idleTime += idleTime;
++    m_cores[core].m_totalTime += totalTime;
++  }
++
++  return static_cast<int>(m_lastUsedPercentage);
++#endif
++}
++
++float CCPUInfoFreebsd::GetCPUFrequency()
++{
++#if defined(__ORBIS__)
++  const int32_t raw = sceKernelGetCpuFrequency();
++  if (raw <= 0)
++    return 0.0f;
++  // Some firmwares return MHz, others Hz.
++  return raw > 1000000 ? static_cast<float>(raw) / 1000000.0f : static_cast<float>(raw);
++#else
++  int hz = 0;
++  size_t len = sizeof(hz);
++  if (sysctlbyname("dev.cpu.0.freq", &hz, &len, nullptr, 0) != 0)
++    hz = 0;
++
++  return static_cast<float>(hz);
++#endif
++}
++
++
++bool CCPUInfoFreebsd::GetTemperature(CTemperature& temperature)
++{
++  if (CheckUserTemperatureCommand(temperature))
++    return true;
++
++#if defined(__ORBIS__)
++  uint64_t value = 0;
++  if (sceKernelGetCpuTemperature(&value) == 0 && value > 0)
++  {
++    const double celsius = value > 200 ? static_cast<double>(value) / 1000.0
++                                       : static_cast<double>(value);
++    temperature = CTemperature::CreateFromCelsius(celsius);
++    temperature.SetValid(true);
++    return true;
++  }
++  return false;
++#else
++  int value;
++  size_t len = sizeof(value);
++
++  /* Temperature is in Kelvin * 10 */
++  if (sysctlbyname("dev.cpu.0.temperature", &value, &len, nullptr, 0) != 0)
++    return false;
++
++  temperature = CTemperature::CreateFromKelvin(static_cast<double>(value) / 10.0);
++  temperature.SetValid(true);
++
++  return true;
++#endif
++}
+diff --git a/xbmc/platform/ps4/CPUInfoFreebsd.h b/xbmc/platform/ps4/CPUInfoFreebsd.h
+new file mode 100644
+index 0000000000..f1743ce039
+--- /dev/null
++++ b/xbmc/platform/ps4/CPUInfoFreebsd.h
+@@ -0,0 +1,24 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "utils/Temperature.h"
++
++#include "platform/posix/CPUInfoPosix.h"
++
++class CCPUInfoFreebsd : public CCPUInfoPosix
++{
++public:
++  CCPUInfoFreebsd();
++  ~CCPUInfoFreebsd() = default;
++
++  int GetUsedPercentage() override;
++  float GetCPUFrequency() override;
++  bool GetTemperature(CTemperature& temperature) override;
++};
+diff --git a/xbmc/platform/ps4/CxaThreadAtexit.cpp b/xbmc/platform/ps4/CxaThreadAtexit.cpp
+new file mode 100644
+index 0000000000..1485098b5b
+--- /dev/null
++++ b/xbmc/platform/ps4/CxaThreadAtexit.cpp
+@@ -0,0 +1,65 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++// The PS4 SDK ships libc++ 11, whose __cxa_thread_atexit refers to
++// __cxa_thread_atexit_impl, but the implementation is not part of the
++// sysroot.  Register the thread_local destructors on a pthread key so they
++// run when the owning thread exits.
++
++#include <pthread.h>
++
++#include <vector>
++
++namespace
++{
++struct ThreadDestructor
++{
++  void (*dtor)(void*);
++  void* obj;
++};
++
++void RunThreadDestructors(void* data)
++{
++  auto* destructors = static_cast<std::vector<ThreadDestructor>*>(data);
++  for (auto it = destructors->rbegin(); it != destructors->rend(); ++it)
++    it->dtor(it->obj);
++  delete destructors;
++}
++
++pthread_key_t DestructorKey()
++{
++  static const pthread_key_t key = [] {
++    pthread_key_t created;
++    if (pthread_key_create(&created, RunThreadDestructors) != 0)
++      return static_cast<pthread_key_t>(-1);
++    return created;
++  }();
++  return key;
++}
++} // namespace
++
++extern "C" int __cxa_thread_atexit_impl(void (*dtor)(void*), void* obj, void* dso_handle)
++{
++  const pthread_key_t key = DestructorKey();
++  if (key == static_cast<pthread_key_t>(-1))
++    return -1;
++
++  auto* destructors = static_cast<std::vector<ThreadDestructor>*>(pthread_getspecific(key));
++  if (destructors == nullptr)
++  {
++    destructors = new std::vector<ThreadDestructor>();
++    if (pthread_setspecific(key, destructors) != 0)
++    {
++      delete destructors;
++      return -1;
++    }
++  }
++
++  destructors->push_back({dtor, obj});
++  return 0;
++}
+diff --git a/xbmc/platform/ps4/GPUInfoFreebsd.cpp b/xbmc/platform/ps4/GPUInfoFreebsd.cpp
+new file mode 100644
+index 0000000000..030b652d23
+--- /dev/null
++++ b/xbmc/platform/ps4/GPUInfoFreebsd.cpp
+@@ -0,0 +1,24 @@
++/*
++ *  Copyright (C) 2023 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "GPUInfoFreebsd.h"
++
++std::unique_ptr<CGPUInfo> CGPUInfo::GetGPUInfo()
++{
++  return std::make_unique<CGPUInfoFreebsd>();
++}
++
++bool CGPUInfoFreebsd::SupportsPlatformTemperature() const
++{
++  return false;
++}
++
++bool CGPUInfoFreebsd::GetGPUPlatformTemperature(CTemperature& temperature) const
++{
++  return false;
++}
+diff --git a/xbmc/platform/ps4/GPUInfoFreebsd.h b/xbmc/platform/ps4/GPUInfoFreebsd.h
+new file mode 100644
+index 0000000000..62016ecc40
+--- /dev/null
++++ b/xbmc/platform/ps4/GPUInfoFreebsd.h
+@@ -0,0 +1,22 @@
++/*
++ *  Copyright (C) 2023 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "platform/posix/GPUInfoPosix.h"
++
++class CGPUInfoFreebsd : public CGPUInfoPosix
++{
++public:
++  CGPUInfoFreebsd() = default;
++  ~CGPUInfoFreebsd() = default;
++
++private:
++  bool SupportsPlatformTemperature() const override;
++  bool GetGPUPlatformTemperature(CTemperature& temperature) const override;
++};
+diff --git a/xbmc/platform/ps4/MemUtils.cpp b/xbmc/platform/ps4/MemUtils.cpp
+new file mode 100644
+index 0000000000..64712cc58d
+--- /dev/null
++++ b/xbmc/platform/ps4/MemUtils.cpp
+@@ -0,0 +1,179 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "utils/MemUtils.h"
++
++#include "utils/log.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <stdio.h>
++
++#include <unistd.h> /* Ps4 can't write standalone headers */
++#if defined(__ORBIS__)
++#include <orbis/libkernel.h>
++#else
++#include <sys/sysctl.h> /* Ps4 can't write standalone headers */
++#endif
++#include <sys/types.h>
++
++namespace KODI
++{
++namespace MEMORY
++{
++
++void* AlignedMalloc(size_t s, size_t alignTo)
++{
++  void* p = nullptr;
++  if (posix_memalign(&p, alignTo, s) != 0)
++    return nullptr;
++
++  return p;
++}
++
++void AlignedFree(void* p)
++{
++  free(p);
++}
++
++uint64_t GetAvailableFlexibleMemorySize()
++{
++#if defined(__ORBIS__)
++  uint64_t available = 0;
++  using AvailableFlexibleFn = int32_t (*)(uint64_t*);
++  const auto availableFlexible =
++      reinterpret_cast<AvailableFlexibleFn>(&sceKernelAvailableFlexibleMemorySize);
++  return availableFlexible(&available) == 0 ? available : 0;
++#else
++  return 0;
++#endif
++}
++
++uint64_t GetAvailableDirectMemorySize()
++{
++#if defined(__ORBIS__)
++  const uint64_t directMemory = sceKernelGetDirectMemorySize();
++  uint64_t directPhys = 0;
++  uint64_t directAvailable = 0;
++  using AvailableDirectFn = int32_t (*)(int64_t, int64_t, uint64_t, uint64_t*, uint64_t*);
++  const auto availableDirect =
++      reinterpret_cast<AvailableDirectFn>(&sceKernelAvailableDirectMemorySize);
++  const int32_t rc = availableDirect(0, static_cast<int64_t>(directMemory), 16 * 1024,
++                                     &directPhys, &directAvailable);
++  return rc == 0 ? directAvailable : 0;
++#else
++  return 0;
++#endif
++}
++
++uint64_t GetCurrentRssBytes()
++{
++#if defined(__ORBIS__)
++  FILE* f = fopen("/proc/self/statm", "r");
++  if (!f)
++    return 0;
++
++  unsigned long size = 0;
++  unsigned long resident = 0;
++  const int fields = fscanf(f, "%lu %lu", &size, &resident);
++  fclose(f);
++  if (fields != 2)
++    return 0;
++
++  long pageSize = sysconf(_SC_PAGESIZE);
++  if (pageSize <= 0)
++    pageSize = 4096;
++  return static_cast<uint64_t>(resident) * static_cast<uint64_t>(pageSize);
++#else
++  return 0;
++#endif
++}
++
++void GetMemoryStatus(MemoryStatus* buffer)
++{
++  if (!buffer)
++    return;
++
++#if defined(__ORBIS__)
++  const uint64_t directMemory = sceKernelGetDirectMemorySize();
++  const uint64_t totalPhys = directMemory > 0 ? directMemory : 8ULL * 1024ULL * 1024ULL * 1024ULL;
++
++  uint64_t flexibleAvailable = 0;
++  using AvailableFlexibleFn = int32_t (*)(uint64_t*);
++  const auto availableFlexible =
++      reinterpret_cast<AvailableFlexibleFn>(&sceKernelAvailableFlexibleMemorySize);
++  const int32_t flexRc = availableFlexible(&flexibleAvailable);
++
++  uint64_t directAvailable = 0;
++  uint64_t directPhys = 0;
++  using AvailableDirectFn = int32_t (*)(int64_t, int64_t, uint64_t, uint64_t*, uint64_t*);
++  const auto availableDirect =
++      reinterpret_cast<AvailableDirectFn>(&sceKernelAvailableDirectMemorySize);
++  const int32_t directRc = availableDirect(0, static_cast<int64_t>(directMemory), 16 * 1024,
++                                           &directPhys, &directAvailable);
++
++  buffer->totalPhys = totalPhys;
++  uint64_t available = (flexRc == 0) ? flexibleAvailable : 0;
++  if (available == 0 && directRc == 0)
++    available = directAvailable;
++  buffer->availPhys = std::min(available, totalPhys);
++
++  static bool logged = false;
++  if (!logged)
++  {
++    logged = true;
++    CLog::Log(LOGINFO,
++              "PS4 memory: total={} MB flexible_avail={} MB (rc={}) direct_avail={} MB (rc={})",
++              totalPhys / (1024 * 1024), flexibleAvailable / (1024 * 1024), flexRc,
++              directAvailable / (1024 * 1024), directRc);
++  }
++#else
++  /* sysctl hw.physmem */
++  size_t len = 0;
++
++  /* physmem */
++  size_t physmem = 0;
++  len = sizeof(physmem);
++  if (sysctlbyname("hw.physmem", &physmem, &len, NULL, 0) == 0)
++  {
++    buffer->totalPhys = physmem;
++  }
++
++  /* pagesize */
++  size_t pagesize = 0;
++  len = sizeof(pagesize);
++  if (sysctlbyname("hw.pagesize", &pagesize, &len, NULL, 0) != 0)
++    pagesize = 4096;
++
++  /* mem_inactive */
++  size_t mem_inactive = 0;
++  len = sizeof(mem_inactive);
++  if (sysctlbyname("vm.stats.vm.v_inactive_count", &mem_inactive, &len, NULL, 0) == 0)
++    mem_inactive *= pagesize;
++
++  /* mem_cache */
++  size_t mem_cache = 0;
++  len = sizeof(mem_cache);
++  if (sysctlbyname("vm.stats.vm.v_cache_count", &mem_cache, &len, NULL, 0) == 0)
++    mem_cache *= pagesize;
++
++  /* mem_free */
++  size_t mem_free = 0;
++  len = sizeof(mem_free);
++  if (sysctlbyname("vm.stats.vm.v_free_count", &mem_free, &len, NULL, 0) == 0)
++    mem_free *= pagesize;
++
++  /* mem_avail = mem_inactive + mem_cache + mem_free */
++  buffer->availPhys = mem_inactive + mem_cache + mem_free;
++#endif
++}
++
++}
++}
+diff --git a/xbmc/platform/ps4/OptionalsReg.cpp b/xbmc/platform/ps4/OptionalsReg.cpp
+new file mode 100644
+index 0000000000..15819297e7
+--- /dev/null
++++ b/xbmc/platform/ps4/OptionalsReg.cpp
+@@ -0,0 +1,29 @@
++/*
++ *  Copyright (C) 2005-2019 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "OptionalsReg.h"
++
++
++//-----------------------------------------------------------------------------
++// OSS
++//-----------------------------------------------------------------------------
++
++#ifdef HAS_OSS
++#include "cores/AudioEngine/Sinks/AESinkOSS.h"
++bool OPTIONALS::OSSRegister()
++{
++  CAESinkOSS::Register();
++  return true;
++}
++#else
++// The PS4 has no OSS sink, the audio output goes through the platform sink.
++bool OPTIONALS::OSSRegister()
++{
++  return false;
++}
++#endif
+diff --git a/xbmc/platform/ps4/OptionalsReg.h b/xbmc/platform/ps4/OptionalsReg.h
+new file mode 100644
+index 0000000000..36837d0b0e
+--- /dev/null
++++ b/xbmc/platform/ps4/OptionalsReg.h
+@@ -0,0 +1,18 @@
++/*
++ *  Copyright (C) 2005-2019 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++//-----------------------------------------------------------------------------
++// OSS
++//-----------------------------------------------------------------------------
++
++namespace OPTIONALS
++{
++bool OSSRegister();
++}
+diff --git a/xbmc/platform/ps4/PS4HardwareProfile.cpp b/xbmc/platform/ps4/PS4HardwareProfile.cpp
+new file mode 100644
+index 0000000000..9f6cbabacd
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4HardwareProfile.cpp
+@@ -0,0 +1,736 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "PS4HardwareProfile.h"
++
++#include "ServiceBroker.h"
++#include "CompileInfo.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
++#include "utils/MemUtils.h"
++#include "utils/log.h"
++
++#include <array>
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fcntl.h>
++#include <poll.h>
++#include <string>
++#include <sys/socket.h>
++#include <sys/statvfs.h>
++#include <unistd.h>
++
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <netinet/in.h>
++
++#include <orbis/NetCtl.h>
++#include <orbis/Net.h>
++#include <orbis/Sysmodule.h>
++#include <orbis/_types/sys_service.h>
++#include <orbis/_types/video.h>
++#include <orbis/libkernel.h>
++
++namespace
++{
++
++/* VideoOut entry points whose SDK prototypes are untyped (void).  The
++ * signatures below were recovered from libSceVideoOut.sprx (FW 9.00):
++ *  - GetHdmiMonitorInfoNoMask_(handle, buffer, 0x180)
++ *  - GetCurrentOutputMode_(handle, 0x20-byte buffer)
++ *  - GetDeviceCapabilityInfo_(handle, uint64_t*)
++ *  - GetDisplaySafeAreaInfo(float*)
++ */
++extern "C" int32_t sceVideoOutGetResolutionStatus(int32_t handle,
++                                                  OrbisVideoOutResolutionStatus* status);
++extern "C" int32_t sceVideoOutGetHdmiMonitorInfoNoMask_(int32_t handle, void* info, size_t size);
++extern "C" int32_t sceVideoOutGetCurrentOutputMode_(int32_t handle, void* mode);
++extern "C" int32_t sceVideoOutGetDeviceCapabilityInfo_(int32_t handle, void* info);
++extern "C" int32_t sceVideoOutSysGetMonitorInfo_(int32_t bus, void* info, size_t size);
++extern "C" int32_t sceVideoOutSysGetDeviceCapabilityInfoByBusSpecifier_(uint32_t bus,
++                                                                         void* info, size_t size);
++extern "C" int32_t sceVideoOutSysGetCurrentOutputMode_(uint32_t bus, void* mode);
++extern "C" int32_t sceSystemServiceGetDisplaySafeAreaInfo(float* safeArea);
++extern "C" int32_t sceSystemServiceParamGetInt(int32_t paramId, int32_t* value);
++extern "C" int32_t sceKernelGetCpuTemperature(uint64_t* temperature);
++
++extern "C" int glShimGetVideoOutHandle(void);
++extern "C" uint64_t glShimGetVideoOutCapability(void);
++
++struct VideoOutCapability
++{
++  uint64_t capability;
++};
++
++struct KernelTimezone
++{
++  int32_t minutesWest;
++  int32_t dstMinutes;
++};
++
++KODI::PLATFORM::PS4::HardwareProfile g_profile;
++
++std::string HexDump(const uint8_t* data, size_t size)
++{
++  static const char* digits = "0123456789abcdef";
++  std::string out;
++  out.reserve(size * 2);
++  for (size_t i = 0; i < size; ++i)
++  {
++    out.push_back(digits[data[i] >> 4]);
++    out.push_back(digits[data[i] & 0x0f]);
++  }
++  return out;
++}
++
++int ConnectTest(const char* ip, int port, int timeoutMs)
++{
++  if (!ip || !ip[0])
++    return -EINVAL;
++
++  const int fd = socket(AF_INET, SOCK_STREAM, 0);
++  if (fd < 0)
++    return -errno;
++
++  const int flags = fcntl(fd, F_GETFL, 0);
++  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++
++  sockaddr_in addr{};
++  addr.sin_family = AF_INET;
++  addr.sin_port = htons(static_cast<uint16_t>(port));
++  if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
++  {
++    close(fd);
++    return -EINVAL;
++  }
++
++  int rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
++  if (rc < 0 && errno == EINPROGRESS)
++  {
++    pollfd pfd{fd, POLLOUT, 0};
++    rc = poll(&pfd, 1, timeoutMs);
++    if (rc > 0)
++    {
++      int err = 0;
++      socklen_t len = sizeof(err);
++      getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
++      rc = err ? -err : 0;
++    }
++    else
++    {
++      rc = rc == 0 ? -ETIMEDOUT : -errno;
++    }
++  }
++  else if (rc < 0)
++  {
++    rc = -errno;
++  }
++
++  close(fd);
++  return rc;
++}
++
++std::string ProfileDir()
++{
++  const char* home = getenv("HOME");
++  const std::string dir = home && home[0] ? home : "/data/kodi-ps4";
++  return dir + "/.kodi/userdata";
++}
++
++void ProbeConsoleTimezone()
++{
++  int32_t tz = 0;
++  int32_t dst = 0;
++  const int32_t tzRc =
++      sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_TIME_ZONE, &tz);
++  const int32_t dstRc =
++      sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_SUMMERTIME, &dst);
++  if (tzRc == 0)
++    g_profile.timeZone = tz;
++  if (dstRc == 0)
++    g_profile.summerTime = dst;
++
++  // The kernel reports the standard offset and the current DST correction
++  // separately; it is used as a fallback for the service parameters.
++  KernelTimezone kernel = {};
++  using GettimezoneFn = int32_t (*)(void*);
++  const auto gettimezone = reinterpret_cast<GettimezoneFn>(&sceKernelGettimezone);
++  const int32_t kernelRc = gettimezone(&kernel);
++  g_profile.tzKernelMinutesWest = kernel.minutesWest;
++  g_profile.tzKernelDstMinutes = kernel.dstMinutes;
++
++  bool haveOffset = false;
++  int offsetMinutes = 0;
++  const bool serviceOffsetValid =
++      tzRc == 0 && tz >= -14 * 60 && tz <= 14 * 60 && dstRc == 0 && (dst == 0 || dst == 1);
++  if (serviceOffsetValid)
++  {
++    // PARAM_ID_TIME_ZONE is the standard offset in minutes east of UTC and
++    // PARAM_ID_SUMMERTIME is the DST offset in hours.
++    offsetMinutes = tz + dst * 60;
++    haveOffset = true;
++  }
++  else if (kernelRc == 0 && kernel.minutesWest >= -14 * 60 &&
++           kernel.minutesWest <= 14 * 60 &&
++           (kernel.dstMinutes == 0 || kernel.dstMinutes == 60) &&
++           (kernel.minutesWest != 0 || kernel.dstMinutes != 0))
++  {
++    offsetMinutes = -kernel.minutesWest + kernel.dstMinutes;
++    haveOffset = true;
++  }
++
++  if (!haveOffset)
++    return;
++
++  g_profile.tzOffsetMinutes = offsetMinutes;
++  const int hours = offsetMinutes / 60;
++  int minutes = offsetMinutes % 60;
++  if (minutes < 0)
++    minutes = -minutes;
++
++  // POSIX TZ offsets are positive west of UTC, hence the inverted sign.
++  char buffer[32];
++  if (minutes == 0)
++    snprintf(buffer, sizeof(buffer), "UTC%+d", -hours);
++  else
++    snprintf(buffer, sizeof(buffer), "UTC%+d:%02d", -hours, minutes);
++
++  g_profile.tzString = buffer;
++  setenv("TZ", buffer, 1);
++  tzset();
++}
++
++void LogConsoleTime()
++{
++  const time_t now = time(nullptr);
++  struct tm localTime = {};
++  struct tm utcTime = {};
++  localtime_r(&now, &localTime);
++  gmtime_r(&now, &utcTime);
++
++  char localText[32] = {};
++  char utcText[32] = {};
++  strftime(localText, sizeof(localText), "%Y-%m-%d %H:%M:%S", &localTime);
++  strftime(utcText, sizeof(utcText), "%Y-%m-%d %H:%M:%S", &utcTime);
++
++  CLog::Log(LOGINFO,
++            "PS4 time: tz={} dst={} kernel={}minW/{}minD offset={}min TZ={} local={} utc={}",
++            g_profile.timeZone, g_profile.summerTime, g_profile.tzKernelMinutesWest,
++            g_profile.tzKernelDstMinutes, g_profile.tzOffsetMinutes, g_profile.tzString,
++            localText, utcText);
++}
++
++void ProbeNetwork()
++{
++  OrbisNetCtlInfo info{};
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_LINK, &info) == 0)
++  {
++    g_profile.netLink = info.link != 0;
++    g_profile.netValid = true;
++  }
++
++  /* Orbis exposes the interface type, MTU and (on WLAN) SSID/RSSI through
++   * NetCtl.  Collect them on every start and log only the generic values.
++   * Device 0 is Ethernet; a non-zero value is treated as WLAN.  The socket
++   * tuning itself stays generic. */
++  OrbisNetCtlInfo deviceInfo{};
++  g_profile.netDeviceRc = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_DEVICE, &deviceInfo);
++  if (g_profile.netDeviceRc == 0)
++  {
++    g_profile.netDevice = deviceInfo.device;
++    g_profile.netWifi = deviceInfo.device != 0;
++  }
++
++  OrbisNetCtlInfo mtuInfo{};
++  g_profile.netMtuRc = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_MTU, &mtuInfo);
++  if (g_profile.netMtuRc == 0)
++    g_profile.netMtu = mtuInfo.mtu;
++
++  if (g_profile.netWifi)
++  {
++    OrbisNetCtlInfo wifiInfo{};
++    if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_SSID, &wifiInfo) == 0)
++    {
++      /* The union is fixed-size; stop at the first NUL so stale bytes after
++       * the SSID do not leak into the log/JSON.  Keep only printable ASCII
++       * and escape JSON-sensitive characters. */
++      char ssid[33] = {};
++      size_t length = 0;
++      while (length < sizeof(wifiInfo.ssid) && wifiInfo.ssid[length] != '\0')
++        ++length;
++      if (length >= sizeof(ssid))
++        length = sizeof(ssid) - 1;
++      memcpy(ssid, wifiInfo.ssid, length);
++      ssid[length] = '\0';
++      for (size_t i = 0; i < length; ++i)
++      {
++        const unsigned char c = static_cast<unsigned char>(ssid[i]);
++        if (c < 0x20 || c > 0x7e || ssid[i] == '"' || ssid[i] == '\\')
++          ssid[i] = '?';
++      }
++      g_profile.netSsid = ssid;
++    }
++    if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_RSSI_DBM, &wifiInfo) == 0)
++      g_profile.netRssiDbm = static_cast<int8_t>(wifiInfo.rssi_dbm);
++    if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_RSSI_PERCENTAGE, &wifiInfo) == 0)
++      g_profile.netRssiPercentage = wifiInfo.rssi_percentage;
++    if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_CHANNEL, &wifiInfo) == 0)
++      g_profile.netChannel = wifiInfo.channel;
++  }
++
++  g_profile.netInterface = g_profile.netWifi ? "wlan0" : "eth0";
++
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_IP_ADDRESS, &info) == 0)
++    g_profile.netIp = info.ip_address;
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_NETMASK, &info) == 0)
++    g_profile.netMask = info.netmask;
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_DEFAULT_ROUTE, &info) == 0)
++    g_profile.netGateway = info.default_route;
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_PRIMARY_DNS, &info) == 0)
++    g_profile.netDns1 = info.primary_dns;
++  if (sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_SECONDARY_DNS, &info) == 0)
++    g_profile.netDns2 = info.secondary_dns;
++
++  g_profile.netValid = true;
++
++  g_profile.netGatewayRc = ConnectTest(g_profile.netGateway.c_str(), 80, 1000);
++
++  errno = 0;
++#if defined(SOCK_NONBLOCK)
++  const int flagSocket = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
++  g_profile.netNonblockSocketRc = flagSocket >= 0 ? 0 : -errno;
++  if (flagSocket >= 0)
++    close(flagSocket);
++#endif
++
++  addrinfo hints = {};
++  hints.ai_family = AF_INET;
++  hints.ai_socktype = SOCK_STREAM;
++  addrinfo* resolved = nullptr;
++  g_profile.netDnsRc = getaddrinfo("mirrors.kodi.tv", "443", &hints, &resolved);
++  if (g_profile.netDnsRc == 0 && resolved)
++  {
++    char ip[INET_ADDRSTRLEN] = {};
++    const auto* address = reinterpret_cast<const sockaddr_in*>(resolved->ai_addr);
++    if (inet_ntop(AF_INET, &address->sin_addr, ip, sizeof(ip)))
++      g_profile.netMirrorIp = ip;
++    g_profile.netInternetRc = ConnectTest(ip, 443, 2000);
++    freeaddrinfo(resolved);
++  }
++  else
++  {
++    g_profile.netInternetRc = -EAI_FAIL;
++  }
++
++  // NetCtl already provides link/IP; use its ETHER_ADDR entry first because
++  // sceNetGetMacAddress can fail before the NET sysmodule is fully ready.
++  unsigned char macBytes[6] = {};
++  bool haveMac = false;
++
++  OrbisNetCtlInfo macInfo{};
++  g_profile.netMacRc = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_ETHER_ADDR, &macInfo);
++  if (g_profile.netMacRc == 0)
++  {
++    memcpy(macBytes, macInfo.ether_addr, sizeof(macBytes));
++    haveMac = true;
++  }
++  else
++  {
++    OrbisNetEtherAddr ether = {};
++    g_profile.netMacRc = sceNetGetMacAddress(&ether, sizeof(ether));
++    if (g_profile.netMacRc == 0)
++    {
++      memcpy(macBytes, ether.data, sizeof(macBytes));
++      haveMac = true;
++    }
++  }
++
++  if (haveMac)
++  {
++    char mac[18] = {};
++    g_profile.netMacFormatRc = sceNetEtherNtostr(macBytes, mac, sizeof(mac));
++    if (g_profile.netMacFormatRc == 0)
++      g_profile.netMac = mac;
++  }
++}
++
++} // namespace
++
++namespace KODI::PLATFORM::PS4
++{
++
++void ProbeHardwareProfileEarly()
++{
++  g_profile = {};
++
++  // _SC_NPROCESSORS_ONLN is not reliable on Orbis; PS4 base and Pro both
++  // have eight Jaguar cores.
++  const long cores = sysconf(_SC_NPROCESSORS_ONLN);
++  g_profile.cpuCores = (cores > 0 && cores <= 64) ? static_cast<int>(cores) : 8;
++
++  const long pages = sysconf(_SC_PHYS_PAGES);
++  const long pageSize = sysconf(_SC_PAGESIZE);
++  if (pages > 0 && pageSize > 0)
++    g_profile.memoryTotalMB =
++        static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize) / (1024 * 1024);
++
++  // sysconf(_SC_PHYS_PAGES) returns 0 on this firmware.  Fall back to the
++  // direct-memory budget that libkernel exposes to the application.
++  if (g_profile.memoryTotalMB == 0)
++    g_profile.memoryTotalMB = sceKernelGetDirectMemorySize() / (1024 * 1024);
++
++  const long availPages = sysconf(_SC_AVPHYS_PAGES);
++  if (availPages > 0 && pageSize > 0)
++    g_profile.memoryFreeMB =
++        static_cast<uint64_t>(availPages) * static_cast<uint64_t>(pageSize) / (1024 * 1024);
++
++  g_profile.memoryDirectTotalMB = sceKernelGetDirectMemorySize() / (1024 * 1024);
++  g_profile.memoryFlexibleFreeMB =
++      KODI::MEMORY::GetAvailableFlexibleMemorySize() / (1024 * 1024);
++  g_profile.memoryDirectFreeMB = KODI::MEMORY::GetAvailableDirectMemorySize() / (1024 * 1024);
++  g_profile.memoryRssKB = KODI::MEMORY::GetCurrentRssBytes() / 1024;
++  g_profile.memoryRssSource = g_profile.memoryRssKB > 0 ? "statm" : "none";
++  if (g_profile.memoryFreeMB == 0)
++    g_profile.memoryFreeMB = g_profile.memoryFlexibleFreeMB;
++
++  const auto probeStorage = [](const char* path, uint64_t& freeMB, uint64_t& totalMB, int& rc) {
++    struct statvfs vfs = {};
++    if (statvfs(path, &vfs) == 0)
++    {
++      totalMB = static_cast<uint64_t>(vfs.f_blocks) * vfs.f_frsize / (1024 * 1024);
++      freeMB = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize / (1024 * 1024);
++      rc = 0;
++    }
++    else
++    {
++      rc = -errno;
++    }
++  };
++  probeStorage("/user/data", g_profile.storageUserDataFreeMB,
++               g_profile.storageUserDataTotalMB, g_profile.storageUserDataRc);
++  probeStorage("/data", g_profile.storageDataFreeMB, g_profile.storageDataTotalMB,
++               g_profile.storageDataRc);
++  probeStorage("/app0", g_profile.storageApp0FreeMB, g_profile.storageApp0TotalMB,
++               g_profile.storageApp0Rc);
++  g_profile.storageFreeMB = std::max(g_profile.storageUserDataFreeMB,
++                                     std::max(g_profile.storageDataFreeMB,
++                                              g_profile.storageApp0FreeMB));
++
++  // Orbis no expone sysctlbyname("hw.model"); la CPU de PS4/Pro es Jaguar.
++  g_profile.cpuModel = "AMD Jaguar";
++
++  const int32_t cpuHz = sceKernelGetCpuFrequency();
++  if (cpuHz > 0)
++    g_profile.cpuFreqMHz = cpuHz > 1000000 ? cpuHz / 1000000 : cpuHz;
++
++  uint64_t cpuTemp = 0;
++  if (sceKernelGetCpuTemperature(&cpuTemp) == 0 && cpuTemp > 0)
++  {
++    g_profile.cpuTempC = cpuTemp > 200 ? static_cast<float>(cpuTemp) / 1000.0f
++                                       : static_cast<float>(cpuTemp);
++    g_profile.cpuTempValid = true;
++  }
++
++  g_profile.buildVersion = CCompileInfo::GetVersionCode();
++  g_profile.buildDate = CCompileInfo::GetBuildDate();
++
++  OrbisKernelSwVersion version = {};
++  if (sceKernelGetSystemSwVersion(&version) == 0)
++  {
++    g_profile.firmware.assign(version.VersionString,
++                              strnlen(version.VersionString, sizeof(version.VersionString)));
++  }
++
++  g_profile.neo = sceKernelIsNeoMode() != 0;
++  g_profile.model = g_profile.neo ? "pro" : "base/slim";
++  g_profile.cpuMode = sceKernelGetCpumode();
++
++  sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
++  int32_t language = 0;
++  if (sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_LANG, &language) == 0)
++    g_profile.language = language;
++
++  int32_t value = 0;
++  if (sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_DATE_FORMAT, &value) == 0)
++  {
++    g_profile.dateFormat = value;
++    g_profile.localeValid = true;
++  }
++  if (sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_TIME_FORMAT, &value) == 0)
++  {
++    g_profile.timeFormat = value;
++    g_profile.localeValid = true;
++  }
++  ProbeConsoleTimezone();
++
++  ProbeNetwork();
++  g_profile.valid = true;
++
++  CLog::Log(LOGINFO,
++            "PS4 profile: model={} fw={} neo={} cpu={} mode={} mem={}MB free={}MB "
++            "storage={}MB lang={}",
++            g_profile.model, g_profile.firmware, g_profile.neo, g_profile.cpuCores,
++            g_profile.cpuMode, g_profile.memoryTotalMB, g_profile.memoryFreeMB,
++            g_profile.storageFreeMB, g_profile.language);
++  CLog::Log(LOGINFO,
++            "PS4 profile: cpu_model='{}' freq={}MHz temp={:.1f}C valid={} build={} ({})",
++            g_profile.cpuModel, g_profile.cpuFreqMHz, g_profile.cpuTempC,
++            g_profile.cpuTempValid, g_profile.buildVersion, g_profile.buildDate);
++  CLog::Log(LOGINFO,
++            "PS4 profile: mem direct={}MB direct_free={}MB flexible_free={}MB rss={}KB ({}) "
++            "storage user_free={}MB(rc={}) data_free={}MB(rc={}) app0_free={}MB(rc={})",
++            g_profile.memoryDirectTotalMB, g_profile.memoryDirectFreeMB,
++            g_profile.memoryFlexibleFreeMB, g_profile.memoryRssKB,
++            g_profile.memoryRssSource, g_profile.storageUserDataFreeMB,
++            g_profile.storageUserDataRc, g_profile.storageDataFreeMB, g_profile.storageDataRc,
++            g_profile.storageApp0FreeMB, g_profile.storageApp0Rc);
++  CLog::Log(LOGINFO,
++            "PS4 profile: net link={} wifi={} mtu={} (rc={}) rssi={}dBm/{}% ch={}",
++            g_profile.netLink, g_profile.netWifi, g_profile.netMtu, g_profile.netMtuRc,
++            g_profile.netRssiDbm, g_profile.netRssiPercentage, g_profile.netChannel);
++}
++
++void ProbeHardwareProfileVideo()
++{
++  const int handle = glShimGetVideoOutHandle();
++  if (handle <= 0)
++  {
++    CLog::Log(LOGWARNING, "PS4 profile: no VideoOut handle, video probe skipped");
++    return;
++  }
++
++  OrbisVideoOutResolutionStatus resolution = {};
++  if (sceVideoOutGetResolutionStatus(handle, &resolution) == 0)
++  {
++    g_profile.videoWidth = static_cast<int>(resolution.width);
++    g_profile.videoHeight = static_cast<int>(resolution.height);
++    // The PS4 VideoOut resolution status reports a refresh code, not Hz.
++    // Map the known codes and keep 59.94 as the safe renderer default.
++    switch (resolution.refreshRate)
++    {
++      case 0:
++        g_profile.refreshRate = 59.94;
++        break;
++      case 1:
++        g_profile.refreshRate = 50.0;
++        break;
++      case 2:
++        g_profile.refreshRate = 30.0;
++        break;
++      case 3:
++        g_profile.refreshRate = 59.94;
++        break;
++      case 4:
++        g_profile.refreshRate = 24.0;
++        break;
++      default:
++        g_profile.refreshRate = resolution.refreshRate > 1000
++                                    ? static_cast<double>(resolution.refreshRate) / 1000.0
++                                    : 59.94;
++        break;
++    }
++    g_profile.videoValid = true;
++  }
++
++  VideoOutCapability capability = {};
++  const int32_t capRc = sceVideoOutGetDeviceCapabilityInfo_(handle, &capability);
++  uint64_t capabilities = (capRc == 0) ? capability.capability : 0;
++
++  // The shim owns the live VideoOut handle and its own capability query is
++  // known to succeed on this firmware where the direct call can fail.
++  const uint64_t shimCapabilities = glShimGetVideoOutCapability();
++  if (capabilities == 0)
++    capabilities = shimCapabilities;
++
++  int32_t sysRc = 0;
++  if (capabilities == 0)
++  {
++    // The SysGetMonitorInfo_ entry point returns the same capability bitmask
++    // without a device handle.
++    const int32_t rc = sceVideoOutSysGetMonitorInfo_(0, &capabilities, sizeof(capabilities));
++    sysRc = rc;
++    if (rc != 0)
++      capabilities = 0;
++  }
++
++  // La consulta por handle falla en este firmware (0x80290001).  La variante
++  // "Sys...ByBusSpecifier" acepta el bus (0/1) en vez del handle.
++  uint64_t busCapability = 0;
++  int32_t busRc = -1;
++  uint32_t busUsed = 0;
++  for (uint32_t bus : {0u, 1u})
++  {
++    uint64_t value = 0;
++    const int32_t rc =
++        sceVideoOutSysGetDeviceCapabilityInfoByBusSpecifier_(bus, &value, sizeof(value));
++    if (rc == 0)
++    {
++      busRc = rc;
++      busCapability = value;
++      busUsed = bus;
++      break;
++    }
++    if (busRc == -1)
++      busRc = rc;
++  }
++  g_profile.videoCapsBusRc = busRc;
++  if (busRc == 0)
++  {
++    capabilities = busCapability;
++    g_profile.videoCapsBusValid = true;
++    g_profile.videoCapsBus = busUsed;
++  }
++
++  g_profile.videoCapabilities = capabilities;
++  g_profile.videoCapsRc = capRc;
++  g_profile.videoShimCapabilities = shimCapabilities;
++  g_profile.videoCapsValid = (busRc == 0) || (capabilities != 0);
++  g_profile.hdr10 = (capabilities & 0x80) != 0;
++  // The PS4 can output HDR10, but this renderer only writes SDR RGBA8 and
++  // does not submit HDR metadata, so Kodi never switches the output to HDR.
++  g_profile.hdrAutomatic = false;
++
++  CLog::Log(LOGINFO, "PS4 profile: caps rc={:#x} shim={:#x} sys_rc={:#x} bus_rc={:#x} bus={}",
++            capRc, shimCapabilities, sysRc, busRc, busUsed);
++
++  const int32_t modeRc =
++      sceVideoOutGetCurrentOutputMode_(handle, g_profile.outputMode.data());
++  const int32_t monitorRc = sceVideoOutGetHdmiMonitorInfoNoMask_(
++      handle, g_profile.hdmiMonitor.data(), g_profile.hdmiMonitor.size());
++  g_profile.videoModeRc = modeRc;
++  g_profile.videoMonitorRc = monitorRc;
++  g_profile.videoModeValid = (modeRc == 0);
++  g_profile.videoMonitorValid = (monitorRc == 0);
++
++  int32_t modeSysRc = -1;
++  for (uint32_t bus : {0u, 1u})
++  {
++    if (sceVideoOutSysGetCurrentOutputMode_(bus, g_profile.outputMode.data()) == 0)
++    {
++      modeSysRc = 0;
++      g_profile.videoModeValid = true;
++      break;
++    }
++  }
++  g_profile.videoModeSysRc = modeSysRc;
++
++  int32_t monitorSysRc = -1;
++  for (uint32_t bus : {0u, 1u})
++  {
++    if (sceVideoOutSysGetMonitorInfo_(bus, g_profile.hdmiMonitor.data(),
++                                     g_profile.hdmiMonitor.size()) == 0)
++    {
++      monitorSysRc = 0;
++      g_profile.videoMonitorValid = true;
++      break;
++    }
++  }
++  g_profile.videoMonitorSysRc = monitorSysRc;
++
++  sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
++  float safeArea = 1.0f;
++  if (sceSystemServiceGetDisplaySafeAreaInfo(&safeArea) == 0 && safeArea > 0.0f)
++    g_profile.safeArea = safeArea;
++
++  CLog::Log(LOGINFO,
++            "PS4 profile: video {}x{}@{:.2f} hdr10={} hdr_automatic={} safe={:.3f} caps={:#x} "
++            "mode_rc={} monitor_rc={}",
++            g_profile.videoWidth, g_profile.videoHeight, g_profile.refreshRate, g_profile.hdr10,
++            g_profile.hdrAutomatic, g_profile.safeArea, g_profile.videoCapabilities, modeRc,
++            monitorRc);
++
++  if (g_profile.hdr10)
++    CLog::Log(LOGINFO,
++              "PS4 profile: HDR10 is supported by the console/TV; automatic HDR output is not "
++              "implemented yet (renderer stays SDR)");
++
++  CLog::Log(LOGDEBUG, "PS4 profile: output mode {}", HexDump(g_profile.outputMode.data(),
++                                                              g_profile.outputMode.size()));
++  CLog::Log(LOGDEBUG, "PS4 profile: hdmi monitor {}",
++            HexDump(g_profile.hdmiMonitor.data(), g_profile.hdmiMonitor.size()));
++
++}
++
++void LogHardwareProfile()
++{
++  if (!g_profile.valid)
++    return;
++
++  CLog::Log(LOGINFO,
++            "PS4 profile: summary model={} fw={} cpu={} mem={}MB video={}x{}@{:.2f} "
++            "hdr10={} hdr_automatic={} safe={:.3f} net={}",
++            g_profile.model, g_profile.firmware, g_profile.cpuCores, g_profile.memoryTotalMB,
++            g_profile.videoWidth, g_profile.videoHeight, g_profile.refreshRate, g_profile.hdr10,
++            g_profile.hdrAutomatic, g_profile.safeArea, g_profile.netLink);
++
++  CLog::Log(LOGINFO, "PS4 profile: locale language={} date_format={} time_format={}",
++            g_profile.language, g_profile.dateFormat, g_profile.timeFormat);
++  CLog::Log(LOGINFO,
++            "PS4 profile: net link={} wifi={} mtu={} (rc={}) rssi={}dBm/{}% ch={} "
++            "gw_rc={} internet_rc={}",
++            g_profile.netLink, g_profile.netWifi, g_profile.netMtu, g_profile.netMtuRc,
++            g_profile.netRssiDbm, g_profile.netRssiPercentage, g_profile.netChannel,
++            g_profile.netGatewayRc, g_profile.netInternetRc);
++
++  LogConsoleTime();
++}
++
++void ApplyConsoleLocaleSettings()
++{
++  if (!g_profile.valid || !g_profile.localeValid)
++    return;
++
++  const auto settingsComponent = CServiceBroker::GetSettingsComponent();
++  if (!settingsComponent)
++    return;
++  const auto settings = settingsComponent->GetSettings();
++  if (!settings)
++    return;
++
++  const std::string marker = ProfileDir() + "/.ps4-console-locale";
++  if (access(marker.c_str(), F_OK) == 0)
++    return;
++
++  std::string region;
++  if (g_profile.dateFormat == 0)
++    region = "Canada"; // YYYY-MM-DD
++  else if (g_profile.dateFormat == 2)
++    region = (g_profile.timeFormat == 1) ? "USA (24h)" : "USA (12h)";
++  else
++    region = (g_profile.timeFormat == 1) ? "UK (24h)" : "UK (12h)";
++
++  // Only replace Kodi's default; a region the user already chose is kept.
++  const std::string current = settings->GetString(CSettings::SETTING_LOCALE_COUNTRY);
++  if (current == "USA (12h)" && current != region)
++    settings->SetString(CSettings::SETTING_LOCALE_COUNTRY, region);
++
++  CLog::Log(LOGINFO, "PS4 locale: console date_format={} time_format={} -> region={}",
++            g_profile.dateFormat, g_profile.timeFormat, region);
++
++  const int fd = open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++  if (fd >= 0)
++  {
++    char text[32];
++    const int length = snprintf(text, sizeof(text), "%d %d\n", g_profile.dateFormat,
++                                g_profile.timeFormat);
++    if (length > 0)
++      (void)write(fd, text, length);
++    close(fd);
++  }
++}
++
++const HardwareProfile& GetHardwareProfile()
++{
++  return g_profile;
++}
++
++} // namespace KODI::PLATFORM::PS4
+diff --git a/xbmc/platform/ps4/PS4HardwareProfile.h b/xbmc/platform/ps4/PS4HardwareProfile.h
+new file mode 100644
+index 0000000000..c9f1ffd095
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4HardwareProfile.h
+@@ -0,0 +1,145 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <string>
++
++namespace KODI::PLATFORM::PS4
++{
++
++/*! \brief Hardware/TV information collected from the PS4 on first boot.
++ *
++ * The profile is deliberately a plain data snapshot: every field is read
++ * from a PS4 API or from statvfs/sysconf, and the raw HDMI monitor and
++ * output-mode blobs are kept so newer firmware fields can be decoded later
++ * without recompiling the probe.
++ */
++struct HardwareProfile
++{
++  bool valid{false};
++  bool neo{false};
++  int cpuMode{0};
++  int cpuCores{0};
++  uint64_t memoryTotalMB{0};
++  uint64_t memoryFreeMB{0};
++  uint64_t memoryFlexibleFreeMB{0};
++  uint64_t memoryDirectTotalMB{0};
++  uint64_t memoryDirectFreeMB{0};
++  uint64_t memoryRssKB{0};
++  std::string memoryRssSource;
++  uint64_t storageFreeMB{0};
++  uint64_t storageUserDataFreeMB{0};
++  uint64_t storageUserDataTotalMB{0};
++  int storageUserDataRc{0};
++  uint64_t storageDataFreeMB{0};
++  uint64_t storageDataTotalMB{0};
++  int storageDataRc{0};
++  uint64_t storageApp0FreeMB{0};
++  uint64_t storageApp0TotalMB{0};
++  int storageApp0Rc{0};
++  std::string cpuModel;
++  uint64_t cpuFreqMHz{0};
++  float cpuTempC{0.0f};
++  bool cpuTempValid{false};
++  std::string buildVersion;
++  std::string buildDate;
++  std::string model;
++  std::string firmware;
++  int language{0};
++
++  bool localeValid{false};
++  int dateFormat{1};
++  int timeFormat{1};
++  int timeZone{0};
++  int summerTime{0};
++  int tzOffsetMinutes{0};
++  int tzKernelMinutesWest{0};
++  int tzKernelDstMinutes{0};
++  std::string tzString;
++
++  bool videoValid{false};
++  bool videoCapsValid{false};
++  bool videoModeValid{false};
++  bool videoMonitorValid{false};
++  int videoCapsRc{0};
++  int videoModeRc{0};
++  int videoMonitorRc{0};
++  uint64_t videoShimCapabilities{0};
++  bool videoCapsBusValid{false};
++  int videoCapsBusRc{0};
++  uint32_t videoCapsBus{0xFFFFFFFF};
++  int videoModeSysRc{0};
++  int videoMonitorSysRc{0};
++  int videoWidth{1920};
++  int videoHeight{1080};
++  double refreshRate{59.94};
++  float safeArea{1.0f};
++  bool hdr10{false};
++  bool hdrAutomatic{false};
++  uint64_t videoCapabilities{0};
++  std::array<uint8_t, 0x180> hdmiMonitor{};
++  std::array<uint8_t, 0x20> outputMode{};
++
++  bool netValid{false};
++  bool netLink{false};
++  uint32_t netDevice{0};
++  uint32_t netMtu{0};
++  bool netWifi{false};
++  int32_t netDeviceRc{0};
++  int32_t netMtuRc{0};
++  std::string netSsid;
++  int netRssiDbm{0};
++  int netRssiPercentage{0};
++  int netChannel{0};
++  int netGatewayRc{0};
++  int netInternetRc{0};
++  int netDnsRc{0};
++  int netNonblockSocketRc{0};
++  std::string netMirrorIp;
++  std::string netInterface;
++  std::string netIp;
++  std::string netMask;
++  std::string netGateway;
++  std::string netDns1;
++  std::string netDns2;
++  std::string netMac;
++  int32_t netMacRc{0};
++  int32_t netMacFormatRc{0};
++};
++
++/*! \brief Probe CPU, memory, storage, firmware and network.
++ *
++ * Safe to call from CPlatformPs4::InitStageOne() after the network stack
++ * (sceNetInit) has been initialised.  Network probing is best-effort.
++ */
++void ProbeHardwareProfileEarly();
++
++/*! \brief Probe the current VideoOut mode and the HDMI/EDID monitor info.
++ *
++ * Must be called after the glshim display exists (the VideoOut handle is
++ * owned by the shim).  Read-only: it never changes the video mode.
++ */
++void ProbeHardwareProfileVideo();
++
++/*! \brief Log a one-line summary. */
++void LogHardwareProfile();
++
++/*! \brief Apply the console date/time formats to Kodi on first boot.
++ *
++ * Kodi's region setting controls its short/long date and 12/24-hour clock.
++ * The console language pack may not be bundled, so only the region is set.
++ */
++void ApplyConsoleLocaleSettings();
++
++/*! \brief Access the last probed profile (valid after the probes above). */
++const HardwareProfile& GetHardwareProfile();
++
++} // namespace KODI::PLATFORM::PS4
+diff --git a/xbmc/platform/ps4/PS4Launcher.cpp b/xbmc/platform/ps4/PS4Launcher.cpp
+new file mode 100644
+index 0000000000..703cf75c5a
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4Launcher.cpp
+@@ -0,0 +1,59 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "PS4Launcher.h"
++
++#include "utils/log.h"
++
++#include <cctype>
++
++#if defined(__ORBIS__)
++#include <orbis/SystemService.h>
++#include <orbis/_types/sys_service.h>
++#endif
++
++namespace KODI::PLATFORM::PS4
++{
++
++bool LaunchApp(const std::string& titleId)
++{
++#if defined(__ORBIS__)
++  if (titleId.size() != 9)
++  {
++    CLog::Log(LOGERROR, "PS4 launch: invalid title id '{}'", titleId);
++    return false;
++  }
++
++  for (const char c : titleId)
++  {
++    if (!std::isalnum(static_cast<unsigned char>(c)))
++    {
++      CLog::Log(LOGERROR, "PS4 launch: invalid character in title id '{}'", titleId);
++      return false;
++    }
++  }
++
++  LncAppParam param = {};
++  param.size = sizeof(param);
++  param.user_id = 0;
++  param.app_opt = 0;
++  param.crash_report = 0;
++  param.LaunchAppCheck_flag = LaunchApp_None;
++
++  const char* argv[] = {nullptr};
++  const int32_t rc = sceLncUtilLaunchApp(titleId.c_str(), argv, &param);
++  CLog::Log(LOGINFO, "PS4 launch: title={} rc=0x{:08x}", titleId,
++            static_cast<uint32_t>(rc));
++  return rc == 0;
++#else
++  (void)titleId;
++  return false;
++#endif
++}
++
++} // namespace KODI::PLATFORM::PS4
+diff --git a/xbmc/platform/ps4/PS4Launcher.h b/xbmc/platform/ps4/PS4Launcher.h
+new file mode 100644
+index 0000000000..68a275f517
+--- /dev/null
++++ b/xbmc/platform/ps4/PS4Launcher.h
+@@ -0,0 +1,24 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <string>
++
++namespace KODI::PLATFORM::PS4
++{
++
++/*! \brief Launch an installed PS4 application by title id.
++ *
++ * Uses libSceLncUtil's sceLncUtilLaunchApp().  The title id is the
++ * nine-character id shown by the PS4 application database, e.g.
++ * CUSA12345.
++ */
++bool LaunchApp(const std::string& titleId);
++
++} // namespace KODI::PLATFORM::PS4
+diff --git a/xbmc/platform/ps4/PlatformFreebsd.cpp b/xbmc/platform/ps4/PlatformFreebsd.cpp
+new file mode 100644
+index 0000000000..cfda15874e
+--- /dev/null
++++ b/xbmc/platform/ps4/PlatformFreebsd.cpp
+@@ -0,0 +1,216 @@
++/*
++ *  Copyright (C) 2016-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "PlatformPs4.h"
++
++#include "ServiceBroker.h"
++#include "application/AppParams.h"
++#include "utils/StringUtils.h"
++#include "utils/log.h"
++
++#include "platform/ps4/OptionalsReg.h"
++#include "platform/ps4/PS4HardwareProfile.h"
++#include "utils/MemUtils.h"
++#include "utils/Mime.h"
++#include "windowing/ps4/WinSystemPs4GLES.h"
++#include "platform/ps4/CAESinkPS4.h"
++#include "platform/linux/powermanagement/LinuxPowerSyscall.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <csignal>
++#include <cstdint>
++#include <cstring>
++#include <exception>
++#include <iterator>
++#include <pthread.h>
++#include <fcntl.h>
++#include <sys/resource.h>
++#include <unistd.h>
++#include <unwind.h>
++
++#include <orbis/Net.h>
++#include <orbis/NetCtl.h>
++#include <orbis/Sysmodule.h>
++
++namespace
++{
++
++/*! \brief Load and initialise the PS4 network stack.
++ *
++ * libcurl and the resolver use the BSD socket layer directly, but that layer
++ * is not usable until the NET sysmodule is loaded and sceNetInit() has run.
++ * Without this, the first socket()/getaddrinfo() call made by the repository
++ * or add-on manager aborts the process (CE-34878).
++ *
++ * The calls are best effort: GoldHEN or another plugin may have initialised
++ * the stack already, in which case the returned "already initialised" error
++ * is harmless and networking keeps working.
++ */
++void InitPS4NetworkStack()
++{
++  const uint32_t netModule = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET);
++  (void)netModule;
++
++  const int32_t netInit = sceNetInit();
++  CLog::Log(LOGINFO, "PS4 network: sceNetInit=0x{:08x}", static_cast<uint32_t>(netInit));
++
++  if (netInit == 0)
++  {
++    const int32_t netPool = sceNetPoolCreate("kodiNetPool", 4 * 1024, 0);
++    CLog::Log(LOGINFO, "PS4 network: sceNetPoolCreate=0x{:08x}",
++              static_cast<uint32_t>(netPool));
++  }
++
++  const uint32_t netCtlModule =
++      sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NETCTL);
++  (void)netCtlModule;
++
++  const int32_t netCtlInit = sceNetCtlInit();
++  CLog::Log(LOGINFO, "PS4 network: sceNetCtlInit=0x{:08x}",
++            static_cast<uint32_t>(netCtlInit));
++}
++
++} // namespace
++
++/* The Orbis SDK links musl, whose pthread default stack is only 128 KiB
++ * (default_attr.lo: __default_stacksize = 0x20000).  Kodi/FFmpeg threads are
++ * sized for desktop stacks and a 128 KiB stack overflows while parsing HLS or
++ * decoding video; the guard-page fault cannot run the signal handler.  Wrap
++ * pthread_create so every thread gets at least 2 MiB of stack.  Callers that
++ * explicitly set a larger size keep it; callers using a custom stack pointer
++ * are left untouched (pthread_attr_setstacksize fails and is ignored). */
++extern "C" int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
++                                     void* (*start)(void*), void* arg);
++
++extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
++                                     void* (*start)(void*), void* arg)
++{
++  constexpr size_t kMinStackSize = 2 * 1024 * 1024;
++
++  pthread_attr_t tuned;
++  bool destroy = false;
++  if (attr)
++    tuned = *attr;
++  else
++  {
++    if (pthread_attr_init(&tuned) != 0)
++      return __real_pthread_create(thread, attr, start, arg);
++    destroy = true;
++  }
++
++  size_t stackSize = 0;
++  if (pthread_attr_getstacksize(&tuned, &stackSize) != 0 || stackSize < kMinStackSize)
++    (void)pthread_attr_setstacksize(&tuned, kMinStackSize);
++
++  const int result = __real_pthread_create(thread, &tuned, start, arg);
++  if (destroy)
++    pthread_attr_destroy(&tuned);
++  return result;
++}
++
++void PreparePS4Environment()
++{
++  // The PS4 does not set HOME, the Kodi profile is kept next to the
++  // application data.
++  if (!getenv("HOME"))
++    setenv("HOME", "/data/kodi-ps4", 1);
++
++  // The resources of the application (skins, system files) are shipped in
++  // the package and mounted read only.  Kodi looks for them before the
++  // platform is initialised, so the variable has to be set from main().
++  if (!getenv("KODI_HOME"))
++    setenv("KODI_HOME", "/app0/media/kodi", 1);
++
++  // curl keeps one multi handle per remote host; raise the soft limit so
++  // repository updates do not run out of descriptors.
++  struct rlimit fdLimit = {};
++  if (getrlimit(RLIMIT_NOFILE, &fdLimit) == 0 && fdLimit.rlim_cur < fdLimit.rlim_max)
++  {
++    fdLimit.rlim_cur = fdLimit.rlim_max;
++    setrlimit(RLIMIT_NOFILE, &fdLimit);
++  }
++}
++
++CPlatform* CPlatform::CreateInstance()
++{
++  return new CPlatformPs4();
++}
++
++bool CPlatformPs4::InitStageOne()
++{
++
++  PreparePS4Environment();
++
++  // Initialise the MIME table early, while memory is still available.
++  CMime::GetMimeType("jpg");
++
++  InitPS4NetworkStack();
++
++  KODI::PLATFORM::PS4::ProbeHardwareProfileEarly();
++
++  if (!CPlatformPosix::InitStageOne())
++  {
++    return false;
++  }
++
++  setenv("OS", "Linux", true); // for python scripts that check the OS
++
++#if defined(HAS_GLES)
++  KODI::WINDOWING::PS4::CWinSystemPs4GLES::Register();
++#endif
++
++  CLinuxPowerSyscall::Register();
++
++  std::string_view sink = CServiceBroker::GetAppParams()->GetAudioBackend();
++
++  if (sink == "ps4" || sink.empty())
++  {
++    // PS4 PCM audio goes through CAESinkPS4 (sceAudioOut) / CPadPS4 input;
++    // intentionally no ALSA, PulseAudio, OSS, or sndio registration here.
++    kodi::ps4::CAESinkPS4::Register();
++  }
++  else if (sink == "alsa")
++  {
++    OPTIONALS::ALSARegister();
++  }
++  else if (sink == "pulseaudio")
++  {
++    OPTIONALS::PulseAudioRegister(true);
++  }
++  else if (sink == "oss")
++  {
++    OPTIONALS::OSSRegister();
++  }
++  else if (sink == "sndio")
++  {
++    OPTIONALS::SndioRegister();
++  }
++  else if (sink == "alsa+pulseaudio")
++  {
++    OPTIONALS::ALSARegister();
++    OPTIONALS::PulseAudioRegister(true);
++  }
++  else
++  {
++    if (!OPTIONALS::PulseAudioRegister(false))
++    {
++      if (!OPTIONALS::ALSARegister())
++      {
++        if (!OPTIONALS::SndioRegister())
++        {
++          OPTIONALS::OSSRegister();
++        }
++      }
++    }
++  }
++
++  m_lirc.reset(OPTIONALS::LircRegister());
++
++  return true;
++}
+diff --git a/xbmc/platform/ps4/PlatformFreebsd.h b/xbmc/platform/ps4/PlatformFreebsd.h
+new file mode 100644
+index 0000000000..fc4f361a0a
+--- /dev/null
++++ b/xbmc/platform/ps4/PlatformFreebsd.h
+@@ -0,0 +1,26 @@
++/*
++ *  Copyright (C) 2016-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "platform/linux/OptionalsReg.h"
++#include "platform/posix/PlatformPosix.h"
++
++#include <memory>
++
++class CPlatformPs4 : public CPlatformPosix
++{
++public:
++  CPlatformPs4() = default;
++  ~CPlatformPs4() override = default;
++
++  bool InitStageOne() override;
++
++private:
++  std::unique_ptr<OPTIONALS::CLircContainer, OPTIONALS::delete_CLircContainer> m_lirc;
++};
+diff --git a/xbmc/platform/ps4/PlatformPs4.h b/xbmc/platform/ps4/PlatformPs4.h
+new file mode 100644
+index 0000000000..e23c877336
+--- /dev/null
++++ b/xbmc/platform/ps4/PlatformPs4.h
+@@ -0,0 +1,4 @@
++#pragma once
++#include "PlatformFreebsd.h"
++
++void PreparePS4Environment();
+diff --git a/xbmc/platform/xbmc.cpp b/xbmc/platform/xbmc.cpp
+index 37aa81427f..9788218976 100644
+--- a/xbmc/platform/xbmc.cpp
++++ b/xbmc/platform/xbmc.cpp
+@@ -40,6 +40,7 @@ extern "C" int XBMC_Run(bool renderGUI)
+       g_application.Cleanup();
+     return status;
+   }
++
+   if (!g_application.Initialize())
+   {
+     CMessagePrinter::DisplayError("ERROR: Unable to Initialize. Exiting");
+diff --git a/xbmc/settings/lib/SettingsManager.cpp b/xbmc/settings/lib/SettingsManager.cpp
+index 0fbb7dda97..d339084f65 100644
+--- a/xbmc/settings/lib/SettingsManager.cpp
++++ b/xbmc/settings/lib/SettingsManager.cpp
+@@ -597,6 +597,11 @@ SettingPtr CSettingsManager::GetSetting(const std::string &id) const
+   const auto setting = FindSetting(id);
+   if (setting != m_settings.end())
+   {
++#if defined(__ORBIS__)
++    // handler22: the crash on console was a null CSetting here; log the
++    // requested id and the key of the node the tree walk landed on.
++    if (!setting->second.setting)
++#endif
+     if (setting->second.setting->IsReference())
+       return GetSetting(setting->second.setting->GetReferencedId());
+     return setting->second.setting;
+diff --git a/xbmc/utils/MemUtils.h b/xbmc/utils/MemUtils.h
+index 026690864f..21b9d3dfc3 100644
+--- a/xbmc/utils/MemUtils.h
++++ b/xbmc/utils/MemUtils.h
+@@ -26,5 +26,14 @@ struct MemoryStatus
+ void* AlignedMalloc(size_t s, size_t alignTo);
+ void AlignedFree(void* p);
+ void GetMemoryStatus(MemoryStatus* buffer);
++
++/*! \brief Memoria flexible disponible en la consola (0 si no se puede leer). */
++uint64_t GetAvailableFlexibleMemorySize();
++
++/*! \brief Memoria directa disponible en la consola (0 si no se puede leer). */
++uint64_t GetAvailableDirectMemorySize();
++
++/*! \brief RSS actual del proceso en bytes (0 si /proc no esta disponible). */
++uint64_t GetCurrentRssBytes();
+ }
+ }
+diff --git a/xbmc/utils/SystemInfo.cpp b/xbmc/utils/SystemInfo.cpp
+index 0a6e3e228c..c1e4b7f9e0 100644
+--- a/xbmc/utils/SystemInfo.cpp
++++ b/xbmc/utils/SystemInfo.cpp
+@@ -67,6 +67,9 @@ using namespace winrt::Windows::System::Profile;
+ #include <sys/system_properties.h>
+ #elif defined(TARGET_FREEBSD)
+ #include <sys/param.h>
++#if defined(__ORBIS__)
++#include <orbis/libkernel.h>
++#endif
+ #elif defined(TARGET_LINUX)
+ #include "platform/linux/SysfsPath.h"
+ 
+@@ -83,6 +86,29 @@ namespace
+ {
+ auto startTime = std::chrono::steady_clock::now();
+ 
++#if defined(__ORBIS__)
++std::string GetPS4FirmwareVersion()
++{
++  static std::string version;
++  if (!version.empty())
++    return version;
++
++  OrbisKernelSwVersion sw = {};
++  sw.Size = sizeof(sw);
++  if (sceKernelGetSystemSwVersion(&sw) == 0)
++  {
++    std::string value(sw.VersionString, sizeof(sw.VersionString));
++    value = value.c_str(); // stop at the first NUL
++    const size_t first = value.find_first_not_of(" \t\r\n");
++    const size_t last = value.find_last_not_of(" \t\r\n");
++    if (first != std::string::npos)
++      version = value.substr(first, last - first + 1);
++  }
++
++  return version;
++}
++#endif
++
+ #if defined(TARGET_WEBOS)
+ constexpr const char* osReleaseFile = "/usr/lib/os-release";
+ #elif defined(TARGET_LINUX) && !defined(TARGET_ANDROID)
+@@ -303,11 +329,19 @@ const CSysData &CSysInfoJob::GetData() const
+ 
+ CSysData::INTERNET_STATE CSysInfoJob::GetInternetState()
+ {
++#if defined(__ORBIS__)
++  // Avoid a blocking HTTP probe on the console; a configured interface with
++  // an address is enough for the System Info screen.
++  if (CServiceBroker::GetNetwork().GetFirstConnectedInterface())
++    return CSysData::CONNECTED;
++  return CSysData::DISCONNECTED;
++#else
+   // Internet connection state!
+   auto http = XFILE::CreateHttpClient();
+   if (http->IsInternet())
+     return CSysData::CONNECTED;
+   return CSysData::DISCONNECTED;
++#endif
+ }
+ 
+ std::string CSysInfoJob::GetMACAddress()
+@@ -382,7 +416,11 @@ std::string CSysInfoJob::GetVideoEncoder()
+ 
+ std::string CSysInfoJob::GetBatteryLevel()
+ {
++#if defined(__ORBIS__)
++  return "N/A";
++#else
+   return StringUtils::Format("{}%", CServiceBroker::GetPowerManager().BatteryLevel());
++#endif
+ }
+ 
+ bool CSysInfoJob::SystemUpTime(int iInputMinutes, int &iMinutes, int &iHours, int &iDays)
+@@ -598,6 +636,8 @@ std::string CSysInfo::GetKernelName(bool emptyIfUnknown /*= false*/)
+     auto e = EasClientDeviceInformation();
+     auto os = e.OperatingSystem();
+     g_charsetConverter.wToUTF8(std::wstring(os.c_str()), kernelName);
++#elif defined(__ORBIS__)
++    kernelName = "Orbis";
+ #elif defined(TARGET_POSIX)
+     struct utsname un;
+     if (uname(&un) == 0)
+@@ -648,6 +688,8 @@ std::string CSysInfo::GetKernelVersionFull(void)
+   if (v4)
+     kernelVersionFull += StringUtils::Format(".{}", v4);
+ 
++#elif defined(__ORBIS__)
++  kernelVersionFull = GetPS4FirmwareVersion();
+ #elif defined(TARGET_POSIX)
+   struct utsname un;
+   if (uname(&un) == 0)
+@@ -681,6 +723,8 @@ std::string CSysInfo::GetOsName(bool emptyIfUnknown /* = false*/)
+   {
+ #if defined(TARGET_WINDOWS)
+     osName = GetKernelName() + "-based OS";
++#elif defined(__ORBIS__)
++    osName = "PlayStation 4";
+ #elif defined(TARGET_FREEBSD)
+     osName = GetKernelName(true); // FIXME: for FreeBSD OS name is a kernel name
+ #elif defined(TARGET_DARWIN_IOS)
+@@ -722,7 +766,9 @@ std::string CSysInfo::GetOsVersion(void)
+   if (!osVersion.empty())
+     return osVersion;
+ 
+-#if defined(TARGET_WINDOWS) || defined(TARGET_FREEBSD)
++#if defined(__ORBIS__)
++  osVersion = GetPS4FirmwareVersion();
++#elif defined(TARGET_WINDOWS) || defined(TARGET_FREEBSD)
+   osVersion = GetKernelVersion(); // FIXME: for Win32 and FreeBSD OS version is a kernel version
+ #elif defined(TARGET_DARWIN)
+   osVersion = CDarwinUtils::GetVersionString();
+@@ -820,6 +866,8 @@ std::string CSysInfo::GetOsPrettyNameWithVersion(void)
+     osNameVer.append(" unknown");
+ #elif defined(TARGET_WINDOWS_STORE)
+   osNameVer = GetKernelName() + " " + GetOsVersion();
++#elif defined(__ORBIS__)
++  osNameVer = "PlayStation 4 " + GetPS4FirmwareVersion();
+ #elif defined(TARGET_FREEBSD)
+   osNameVer = GetOsName() + " " + GetOsVersion();
+ #elif defined(TARGET_DARWIN)
+diff --git a/xbmc/utils/TimeUtils.cpp b/xbmc/utils/TimeUtils.cpp
+index 649d66c96d..ad9223d5b4 100644
+--- a/xbmc/utils/TimeUtils.cpp
++++ b/xbmc/utils/TimeUtils.cpp
+@@ -18,13 +18,21 @@
+ #include <CoreVideo/CVHostTime.h>
+ #elif defined(TARGET_WINDOWS)
+ #include <windows.h>
++#elif defined(__ORBIS__)
++#include <orbis/libkernel.h>
+ #else
+ #include <time.h>
+ #endif
+ 
+ namespace
+ {
++#if defined(__ORBIS__)
++// Use the same kernel clock that drives display pacing; steady_clock's
++// CLOCK_MONOTONIC is not guaranteed to track wall time on Orbis.
++int64_t startTimeUs = static_cast<int64_t>(sceKernelGetProcessTime());
++#else
+ auto startTime = std::chrono::steady_clock::now();
++#endif
+ }
+ 
+ int64_t CurrentHostCounter(void)
+@@ -63,10 +71,15 @@ unsigned int CTimeUtils::frameTime = 0;
+ 
+ void CTimeUtils::UpdateFrameTime(bool flip)
+ {
++#if defined(__ORBIS__)
++  const unsigned int currentTime = static_cast<unsigned int>(
++      (static_cast<int64_t>(sceKernelGetProcessTime()) - startTimeUs) / 1000);
++#else
+   auto now = std::chrono::steady_clock::now();
+   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime);
+ 
+   unsigned int currentTime = duration.count();
++#endif
+   unsigned int last = frameTime;
+   while (frameTime < currentTime)
+   {

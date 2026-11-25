@@ -1,0 +1,11 @@
+--- a/Lib/platform.py
++++ b/Lib/platform.py
+@@ -1002,7 +1002,7 @@
+     # Get some infos from the builtin os.uname API...
+     try:
+         system, node, release, version, machine = infos = os.uname()
+-    except AttributeError:
++    except (AttributeError, OSError):
+         system = sys.platform
+         node = _node()
+         release = version = machine = ''

@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 19:30:49 -0300
+Subject: [PATCH 10/12] ps4: bound add-on and SQLite memory use
+
+Orbis has a small flexible heap.  Cache the available-update count instead of building CAddonRepos for the badge, let the updater's ON path call CheckAndInstallAddonUpdates directly, load remote game extensions lazily, and use 128-page SQLite caches.  These are the frontier fixes documented in docs/sessions/2026-11-12-abstraccion-ps4.md and 2026-11-13-red-repositorio.md, adapted to the current clean tree.
+---
+ xbmc/addons/AddonManager.cpp      |  6 +++-
+ xbmc/addons/AddonManager.h        |  1 +
+ xbmc/addons/RepositoryUpdater.cpp | 51 +++++++++++++++++--------------
+ xbmc/dbwrappers/Database.cpp      |  7 ++++-
+ xbmc/dbwrappers/sqlitedataset.cpp |  5 +++
+ xbmc/games/GameUtils.cpp          | 14 ++-------
+ 6 files changed, 48 insertions(+), 36 deletions(-)
+
+diff --git a/xbmc/addons/AddonManager.cpp b/xbmc/addons/AddonManager.cpp
+index 11fdf1c965..e7286a8632 100644
+--- a/xbmc/addons/AddonManager.cpp
++++ b/xbmc/addons/AddonManager.cpp
+@@ -238,6 +238,7 @@ std::vector<std::shared_ptr<IAddon>> CAddonMgr::GetAvailableUpdates() const
+       GetAvailableUpdatesOrOutdatedAddons(AddonCheckType::AVAILABLE_UPDATES);
+ 
+   std::scoped_lock lock(m_lastAvailableUpdatesCountMutex);
++  m_lastAvailableUpdatesCount = static_cast<int>(availableUpdates.size());
+   m_lastAvailableUpdatesCountAsString = std::to_string(availableUpdates.size());
+ 
+   return availableUpdates;
+@@ -320,7 +321,10 @@ std::vector<std::shared_ptr<IAddon>> CAddonMgr::GetCompatibleVersions(
+ 
+ bool CAddonMgr::HasAvailableUpdates() const
+ {
+-  return !GetAvailableUpdates().empty();
++  // Do not construct the full repository catalog just to render the update
++  // badge.  The count is filled by a real GetAvailableUpdates() call.
++  std::scoped_lock lock(m_lastAvailableUpdatesCountMutex);
++  return m_lastAvailableUpdatesCount > 0;
+ }
+ 
+ std::vector<std::shared_ptr<IAddon>> CAddonMgr::GetOrphanedDependencies() const
+diff --git a/xbmc/addons/AddonManager.h b/xbmc/addons/AddonManager.h
+index 4c8596bc5b..25f2bc4c33 100644
+--- a/xbmc/addons/AddonManager.h
++++ b/xbmc/addons/AddonManager.h
+@@ -693,6 +693,7 @@ private:
+   /*!
+      * latest count of available updates
+      */
++  mutable int m_lastAvailableUpdatesCount{0};
+   mutable std::string m_lastAvailableUpdatesCountAsString;
+   mutable std::mutex m_lastAvailableUpdatesCountMutex;
+ };
+diff --git a/xbmc/addons/RepositoryUpdater.cpp b/xbmc/addons/RepositoryUpdater.cpp
+index fa95804ae8..420f786528 100644
+--- a/xbmc/addons/RepositoryUpdater.cpp
++++ b/xbmc/addons/RepositoryUpdater.cpp
+@@ -162,33 +162,38 @@ void CRepositoryUpdater::OnJobComplete(unsigned int jobID, bool success, CJob* j
+     CLog::Log(LOGDEBUG, "CRepositoryUpdater: done.");
+     m_doneEvent.Set();
+ 
+-    VECADDONS updates = m_addonMgr.GetAvailableUpdates();
++    const auto autoUpdateMode =
++        CAddonSystemSettings::GetInstance().GetAddonAutoUpdateMode();
+ 
+-    if (!updates.empty() &&
+-        CAddonSystemSettings::GetInstance().GetAddonAutoUpdateMode() == AUTO_UPDATES_NOTIFY)
++    if (autoUpdateMode == AUTO_UPDATES_ON)
+     {
+-      if (updates.size() == 1)
+-        CGUIDialogKaiToast::QueueNotification(
+-            updates[0]->Icon(), updates[0]->Name(),
+-            CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24068),
+-            TOAST_DISPLAY_TIME, false, TOAST_DISPLAY_TIME);
+-      else
+-        CGUIDialogKaiToast::QueueNotification(
+-            "", CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24001),
+-            CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24061),
+-            TOAST_DISPLAY_TIME, false, TOAST_DISPLAY_TIME);
+-
+-      auto eventLog = CServiceBroker::GetEventLog();
+-      for (const auto& addon : updates)
+-      {
+-        if (eventLog)
+-          eventLog->Add(std::make_shared<CAddonManagementEvent>(addon, 24068));
+-      }
++      // CheckAndInstallAddonUpdates() loads the update list itself; do not
++      // construct CAddonRepos here as well.
++      m_addonMgr.CheckAndInstallAddonUpdates(false);
+     }
+-
+-    if (CAddonSystemSettings::GetInstance().GetAddonAutoUpdateMode() == AUTO_UPDATES_ON)
++    else if (autoUpdateMode == AUTO_UPDATES_NOTIFY)
+     {
+-      m_addonMgr.CheckAndInstallAddonUpdates(false);
++      const VECADDONS updates = m_addonMgr.GetAvailableUpdates();
++      if (!updates.empty())
++      {
++        if (updates.size() == 1)
++          CGUIDialogKaiToast::QueueNotification(
++              updates[0]->Icon(), updates[0]->Name(),
++              CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24068),
++              TOAST_DISPLAY_TIME, false, TOAST_DISPLAY_TIME);
++        else
++          CGUIDialogKaiToast::QueueNotification(
++              "", CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24001),
++              CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24061),
++              TOAST_DISPLAY_TIME, false, TOAST_DISPLAY_TIME);
++
++        auto eventLog = CServiceBroker::GetEventLog();
++        for (const auto& addon : updates)
++        {
++          if (eventLog)
++            eventLog->Add(std::make_shared<CAddonManagementEvent>(addon, 24068));
++        }
++      }
+     }
+ 
+     ScheduleUpdate(UpdateScheduleType::Regular);
+diff --git a/xbmc/dbwrappers/Database.cpp b/xbmc/dbwrappers/Database.cpp
+index 51b1d0c337..a230817293 100644
+--- a/xbmc/dbwrappers/Database.cpp
++++ b/xbmc/dbwrappers/Database.cpp
+@@ -663,8 +663,13 @@ CDatabase::ConnectionState CDatabase::Connect(const std::string& dbName,
+         //  This needs to be done before any table is created.
+         m_pDS->exec("PRAGMA page_size=4096\n");
+ 
+-        //  Also set the memory cache size to 16k
++        //  Also set the memory cache size.  16 MiB is too much for the
++        //  console's flexible-memory budget once several databases are open.
++#if defined(__ORBIS__)
++        m_pDS->exec("PRAGMA default_cache_size=128\n");
++#else
+         m_pDS->exec("PRAGMA default_cache_size=4096\n");
++#endif
+       }
+       CreateDatabase();
+     }
+diff --git a/xbmc/dbwrappers/sqlitedataset.cpp b/xbmc/dbwrappers/sqlitedataset.cpp
+index 49526b6175..53b6232a70 100644
+--- a/xbmc/dbwrappers/sqlitedataset.cpp
++++ b/xbmc/dbwrappers/sqlitedataset.cpp
+@@ -434,8 +434,13 @@ int SqliteDatabase::postconnect()
+   if (!active)
+     throw DbErrors("Cannot execute postconnect actions: no active connection...");
+ 
++#if defined(__ORBIS__)
++  static const char* sqlcmd{
++      "PRAGMA cache_size=128; PRAGMA synchronous='NORMAL'; PRAGMA count_changes='OFF';"};
++#else
+   static const char* sqlcmd{
+       "PRAGMA cache_size=4096; PRAGMA synchronous='NORMAL'; PRAGMA count_changes='OFF';"};
++#endif
+   if (setErr(sqlite3_exec(getHandle(), sqlcmd, nullptr, nullptr, nullptr), sqlcmd) != SQLITE_OK)
+   {
+     throw DbErrors("%s", getErrorMsg());
+diff --git a/xbmc/games/GameUtils.cpp b/xbmc/games/GameUtils.cpp
+index 9df94821e7..418a5fe126 100644
+--- a/xbmc/games/GameUtils.cpp
++++ b/xbmc/games/GameUtils.cpp
+@@ -465,17 +465,9 @@ std::set<std::string> CGameUtils::GetGameExtensions()
+     extensions.insert(gc->GetExtensions().begin(), gc->GetExtensions().end());
+   }
+ 
+-  // Check remote add-ons
+-  std::lock_guard<std::mutex> installableLock(m_installableMutex);
+-  LoadInstallableAddons();
+-  if (!m_installableGameAddons.empty())
+-  {
+-    for (auto& gameClient : m_installableGameAddons)
+-    {
+-      GameClientPtr gc(std::static_pointer_cast<CGameClient>(gameClient));
+-      extensions.insert(gc->GetExtensions().begin(), gc->GetExtensions().end());
+-    }
+-  }
++  // Do not load the remote repository catalog here: this runs during startup
++  // and the full catalog does not fit in the console's flexible memory
++  // budget.  IsExtensionValid() loads it lazily when a file is checked.
+ 
+   // Remove special libretro extensions
+   extensions.erase("*");

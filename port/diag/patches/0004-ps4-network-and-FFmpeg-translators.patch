@@ -1,0 +1,1210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kodi-ps4 dev <dev@kodi-ps4.local>
+Date: Sat, 14 Nov 2026 17:52:36 -0300
+Subject: [PATCH 04/12] ps4: network and FFmpeg translators
+
+Prefer IPv4 DNS, tune curl sockets and retries, initialise curl lazily, and apply the FFmpeg socket/DNS/TLS patches. The demuxer sets reconnect and probe defaults for HLS.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  17 +
+ xbmc/filesystem/CurlFile.cpp                  | 201 ++++++++-
+ xbmc/filesystem/DllLibCurl.cpp                |  64 ++-
+ xbmc/filesystem/DllLibCurl.h                  |   2 +
+ xbmc/filesystem/FileCache.cpp                 |   8 +-
+ xbmc/network/DNSNameCache.cpp                 | 132 +++++-
+ xbmc/network/UdpClient.cpp                    |   6 +
+ xbmc/platform/ps4/network/CMakeLists.txt      |   4 +
+ xbmc/platform/ps4/network/NetworkFreebsd.cpp  | 388 ++++++++++++++++++
+ xbmc/platform/ps4/network/NetworkFreebsd.h    |  52 +++
+ 10 files changed, 833 insertions(+), 41 deletions(-)
+ create mode 100644 xbmc/platform/ps4/network/CMakeLists.txt
+ create mode 100644 xbmc/platform/ps4/network/NetworkFreebsd.cpp
+ create mode 100644 xbmc/platform/ps4/network/NetworkFreebsd.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index bc5186d103..0a528bb20a 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -833,6 +833,23 @@ AVDictionary* CDVDDemuxFFmpeg::GetFFMpegOptionsFromInput()
+ 
+   if (url.IsProtocol("http") || url.IsProtocol("https"))
+   {
++#if defined(__ORBIS__)
++    /* The PS4 Wi-Fi link drops packets while the player is buffering.  Let
++     * FFmpeg reconnect HLS segment/playlist requests instead of returning a
++     * spurious EOF; protocol options below can still override these. */
++    av_dict_set_int(&options, "reconnect", 1, 0);
++    av_dict_set_int(&options, "reconnect_on_network_error", 1, 0);
++    av_dict_set_int(&options, "reconnect_streamed", 1, 0);
++    av_dict_set_int(&options, "reconnect_delay_max", 2, 0);
++    av_dict_set_int(&options, "reconnect_max_retries", 3, 0);
++    /* Each new TLS connection costs ~5 s on the console's Wi-Fi, so do not
++     * probe several HLS segments before starting: 2 MB/2 s is enough for
++     * H.264/AAC and starts closer to the live edge. */
++    av_dict_set_int(&options, "probesize", 2 * 1024 * 1024, 0);
++    av_dict_set_int(&options, "analyzeduration", 2 * 1000000, 0);
++    av_dict_set_int(&options, "live_start_index", -1, 0);
++#endif
++
+     std::map<std::string, std::string> protocolOptions;
+     url.GetProtocolOptions(protocolOptions);
+     std::string headers;
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index be9e0c2f73..c45a280af3 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -25,12 +25,20 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <climits>
++#include <mutex>
+ #include <utility>
+ #include <vector>
+ 
+ #ifdef TARGET_POSIX
+ #include <errno.h>
++#include <fcntl.h>
+ #include <inttypes.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#if defined(__ORBIS__)
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#endif
+ #include "platform/posix/ConvUtils.h"
+ #endif
+ 
+@@ -58,6 +66,77 @@ constexpr auto proxyType2CUrlProxyType{make_map<XFILE::CCurlFile::ProxyType, lon
+     {CCurlFile::ProxyType::HTTPS, CURLPROXY_HTTPS},
+ })};
+ 
++#if defined(__ORBIS__)
++curl_socket_t PS4OpenSocket(void* /*clientp*/, curlsocktype /*purpose*/,
++                            struct curl_sockaddr* address)
++{
++  // curl asks for SOCK_NONBLOCK in the socket type; the Orbis socket layer
++  // rejects the flag, so create a plain socket and set it with fcntl.
++  int type = address->socktype;
++#ifdef SOCK_NONBLOCK
++  type &= ~SOCK_NONBLOCK;
++#endif
++#ifdef SOCK_CLOEXEC
++  type &= ~SOCK_CLOEXEC;
++#endif
++
++  const curl_socket_t fd = socket(address->family, type, address->protocol);
++  if (fd == CURL_SOCKET_BAD)
++    return CURL_SOCKET_BAD;
++
++  const int flags = fcntl(fd, F_GETFL, 0);
++  if (flags >= 0)
++    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++  fcntl(fd, F_SETFD, FD_CLOEXEC);
++
++  /* Tune every curl socket for the console network: enough kernel buffering
++   * for 1080p/HLS bursts, Nagle off for zapping, and keepalive so a dead
++   * peer is detected instead of leaving the player blocked forever.  These
++   * are generic values; the MTU/device are collected in the hardware
++   * profile for diagnostics. */
++  const int one = 1;
++  const int recvBuffer = 256 * 1024;
++  const int sendBuffer = 256 * 1024;
++  const int keepIdle = 30;
++  const int keepInterval = 10;
++  const int keepCount = 3;
++  (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &recvBuffer, sizeof(recvBuffer));
++  (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sendBuffer, sizeof(sendBuffer));
++  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++  (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
++#ifdef TCP_KEEPIDLE
++  (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle));
++#endif
++#ifdef TCP_KEEPINTVL
++  (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(keepInterval));
++#endif
++#ifdef TCP_KEEPCNT
++  (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(keepCount));
++#endif
++
++  /* Log the effective kernel buffer sizes once; the kernel may clamp the
++   * requested values. */
++  static std::once_flag tuneLogged;
++  std::call_once(tuneLogged,
++                 [fd, keepIdle, keepInterval, keepCount]()
++                 {
++                   int actualRecv = 0;
++                   int actualSend = 0;
++                   socklen_t length = sizeof(actualRecv);
++                   if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actualRecv, &length) != 0)
++                     actualRecv = -1;
++                   length = sizeof(actualSend);
++                   if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actualSend, &length) != 0)
++                     actualSend = -1;
++                   CLog::Log(LOGINFO,
++                             "PS4 net: socket tuning rcvbuf={} sndbuf={} nodelay=1 "
++                             "keepalive={}/{}/{}",
++                             actualRecv, actualSend, keepIdle, keepInterval, keepCount);
++                 });
++  return fd;
++}
++#endif
++
+ std::vector<uint8_t> cachedCaCertsBlob; // cached CA certs file
+ 
+ } // unnamed namespace
+@@ -169,12 +248,12 @@ static constexpr int CURL_ON = 1L;
+ static bool IsTransientCurlError(CURLcode result)
+ {
+   return result == CURLE_OPERATION_TIMEDOUT || result == CURLE_PARTIAL_FILE ||
+-         result == CURLE_COULDNT_CONNECT || result == CURLE_HTTP2_STREAM ||
++         result == CURLE_COULDNT_CONNECT || result == CURLE_COULDNT_RESOLVE_HOST ||
++         result == CURLE_COULDNT_RESOLVE_PROXY || result == CURLE_HTTP2_STREAM ||
+          result == CURLE_RECV_ERROR || result == CURLE_SEND_ERROR;
+ }
+ 
+ static CURLcode PerformWithTransientRetries(CURL_HANDLE* easyHandle,
+-                                            const CURL& url,
+                                             const char* functionName)
+ {
+   const int maxRetries =
+@@ -188,13 +267,39 @@ static CURLcode PerformWithTransientRetries(CURL_HANDLE* easyHandle,
+       break;
+ 
+     // Force the next probe off the failed/reused connection.
+-    CLog::Log(LOGWARNING, "CCurlFile::{} - <{}> Transient error {}({}), reconnect and retry {}",
+-              functionName, url.GetRedacted(), g_curlInterface.easy_strerror(result), result,
+-              attempt + 1);
++    CLog::Log(LOGWARNING, "CCurlFile::{} - transient error {}({}), reconnect and retry {}",
++              functionName, g_curlInterface.easy_strerror(result), result, attempt + 1);
+     g_curlInterface.easy_setopt(easyHandle, CURLOPT_FRESH_CONNECT, CURL_ON);
+   }
+ 
+   g_curlInterface.easy_setopt(easyHandle, CURLOPT_FRESH_CONNECT, CURL_OFF); // restore pool reuse
++
++#if defined(__ORBIS__)
++  /* The PS4 Wi-Fi link is the bottleneck for the M3U, repository and HLS
++   * metadata.  Log the slow requests with a phase breakdown so the log shows
++   * whether the time is DNS, TCP connect, TLS or the transfer itself. */
++  if (result == CURLE_OK)
++  {
++    double total = 0.0;
++    if (g_curlInterface.easy_getinfo(easyHandle, CURLINFO_TOTAL_TIME, &total) == CURLE_OK &&
++        total >= 2.0)
++    {
++      double nameLookup = 0.0;
++      double connect = 0.0;
++      double appConnect = 0.0;
++      curl_off_t size = 0;
++      g_curlInterface.easy_getinfo(easyHandle, CURLINFO_NAMELOOKUP_TIME, &nameLookup);
++      g_curlInterface.easy_getinfo(easyHandle, CURLINFO_CONNECT_TIME, &connect);
++      g_curlInterface.easy_getinfo(easyHandle, CURLINFO_APPCONNECT_TIME, &appConnect);
++      g_curlInterface.easy_getinfo(easyHandle, CURLINFO_SIZE_DOWNLOAD_T, &size);
++      CLog::Log(LOGINFO,
++                "CCurlFile::{} - slow transfer total={:.0f} ms dns={:.0f} ms connect={:.0f} "
++                "ms tls={:.0f} ms bytes={}",
++                functionName, total * 1000.0, nameLookup * 1000.0, connect * 1000.0,
++                appConnect * 1000.0, size);
++    }
++  }
++#endif
+   return result;
+ }
+ 
+@@ -390,6 +495,12 @@ void CCurlFile::CReadState::SetResume(void)
+ 
+ long CCurlFile::CReadState::Connect(unsigned int size)
+ {
++  if (!m_multiHandle || !m_easyHandle)
++  {
++    CLog::Log(LOGERROR, "CurlFile::CReadState::{} - missing curl handle", __FUNCTION__);
++    return -1;
++  }
++
+   if (m_filePos != 0)
+     CLog::Log(LOGDEBUG, "CurlFile::CReadState::{} - ({}) Resume from position {}", __FUNCTION__,
+               fmt::ptr(this), m_filePos);
+@@ -527,6 +638,10 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
+ 
+   g_curlInterface.easy_reset(h);
+ 
++#if defined(__ORBIS__)
++  g_curlInterface.easy_setopt(h, CURLOPT_OPENSOCKETFUNCTION, PS4OpenSocket);
++#endif
++
+   g_curlInterface.easy_setopt(h, CURLOPT_DEBUGFUNCTION, debug_callback);
+ 
+   if( CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_logLevel >= LOG_LEVEL_DEBUG )
+@@ -673,8 +788,12 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
+   else /* set some default agent as shoutcast doesn't return proper stuff otherwise */
+     g_curlInterface.easy_setopt(h, CURLOPT_USERAGENT, CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_userAgent.c_str());
+ 
++#if !defined(__ORBIS__)
++  // The PS4 curl build has no IPRESOLVE support (setopt returns
++  // "Malformed option"), so leave the option untouched there.
+   if (CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlDisableIPV6)
+     g_curlInterface.easy_setopt(h, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
++#endif
+ 
+   if (!m_proxyhost.empty())
+   {
+@@ -717,17 +836,40 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
+   g_curlInterface.easy_setopt(h, CURLOPT_LOW_SPEED_TIME, m_lowspeedtime);
+ 
+   // enable tcp keepalive
+-  if (CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlKeepAliveInterval > 0)
++  int keepAliveInterval =
++      CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlKeepAliveInterval;
++#if defined(__ORBIS__)
++  /* Automatic anti-cut default: if the advanced setting is 0, use 30 s
++   * instead of disabling keepalive.  A dead peer is then detected in about
++   * 75 s (15 s idle + 3 probes x 30 s interval). */
++  if (keepAliveInterval <= 0)
++    keepAliveInterval = 30;
++#endif
++  if (keepAliveInterval > 0)
+   {
+     g_curlInterface.easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+-    g_curlInterface.easy_setopt(
+-        h, CURLOPT_TCP_KEEPIDLE,
+-        CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlKeepAliveInterval / 2);
+-    g_curlInterface.easy_setopt(
+-        h, CURLOPT_TCP_KEEPINTVL,
+-        CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlKeepAliveInterval);
++    g_curlInterface.easy_setopt(h, CURLOPT_TCP_KEEPIDLE,
++                                static_cast<long>(std::max(1, keepAliveInterval / 2)));
++    g_curlInterface.easy_setopt(h, CURLOPT_TCP_KEEPINTVL,
++                                static_cast<long>(keepAliveInterval));
++#if defined(__ORBIS__)
++    g_curlInterface.easy_setopt(h, CURLOPT_TCP_KEEPCNT, 3L);
++#endif
+   }
+ 
++#if defined(__ORBIS__)
++  /* Bigger userland receive buffer for video/HLS bursts (libcurl default is
++   * 16 KiB).  The kernel side is tuned in PS4OpenSocket(). */
++  g_curlInterface.easy_setopt(h, CURLOPT_BUFFERSIZE, 256L * 1024L);
++#if LIBCURL_VERSION_NUM >= 0x074900
++  /* OpenSSL 3.5 offers X25519MLKEM768 by default.  Its ~1.2 KiB key share
++   * makes the Client Hello ~1.5 KiB, which the lossy 2.4 GHz link drops;
++   * TCP then retransmits after ~5 s on every new HTTPS connection.  Prefer
++   * classic groups so the hello fits in one segment. */
++  g_curlInterface.easy_setopt(h, CURLOPT_SSL_EC_CURVES, "X25519:P-256");
++#endif
++#endif
++
+   // Setup allowed TLS/SSL ciphers. New versions of cURL may deprecate things that are still in use.
+   if (!m_cipherlist.empty())
+     g_curlInterface.easy_setopt(h, CURLOPT_SSL_CIPHER_LIST, m_cipherlist.c_str());
+@@ -744,6 +886,14 @@ void CCurlFile::SetCommonOptions(CReadState* state, bool failOnError /* = true *
+   if (!caCert.empty() && XFILE::CFile::Exists(caCert))
+     g_curlInterface.easy_setopt(h, CURLOPT_CAINFO, caCert.c_str());
+ 
++#if defined(__ORBIS__)
++  // Orbis has no system CA store; always point curl at Kodi's bundle.
++  const std::string caBundle =
++      CSpecialProtocol::TranslatePath("special://xbmc/system/certs/cacert.pem");
++  if (!caBundle.empty())
++    g_curlInterface.easy_setopt(h, CURLOPT_CAINFO, caBundle.c_str());
++#endif
++
+   // From OpenSSL 3.0 CURLOPT_CAINFO not works (on UWP), use CURLOPT_CAINFO_BLOB instead
+   if (!cachedCaCertsBlob.empty())
+   {
+@@ -819,8 +969,16 @@ void CCurlFile::ParseAndCorrectUrl(CURL &url2)
+         entryPort = 990;
+     }
+ 
++    // CURLOPT_RESOLVE expects IPv6 literals in brackets.  Without them curl
++    // fails with CURLE_SETOPT_OPTION_SYNTAX ("Malformed option provided in a
++    // setopt") and every request to that host fails.
++    std::string resolveTarget = resolvedHost;
++    if (resolveTarget.find(':') != std::string::npos &&
++        (resolveTarget.empty() || resolveTarget.front() != '['))
++      resolveTarget = "[" + resolveTarget + "]";
++
+     std::string entryString =
+-        url2.GetHostName() + ":" + std::to_string(entryPort) + ":" + resolvedHost;
++        url2.GetHostName() + ":" + std::to_string(entryPort) + ":" + resolveTarget;
+     tempCache = g_curlInterface.slist_append(m_dnsCacheList, entryString.c_str());
+ 
+     if (tempCache)
+@@ -1153,6 +1311,12 @@ bool CCurlFile::Open(const CURL& url)
+                                 &m_state->m_easyHandle,
+                                 &m_state->m_multiHandle);
+ 
++  if (m_state->m_easyHandle == NULL || m_state->m_multiHandle == NULL)
++  {
++    CLog::Log(LOGERROR, "CurlFile::{} - failed to acquire curl handles", __FUNCTION__);
++    return false;
++  }
++
+   // setup common curl options
+   SetCommonOptions(m_state,
+                    m_failOnError && !CServiceBroker::GetLogging().CanLogComponent(LOGCURL));
+@@ -1413,7 +1577,7 @@ bool CCurlFile::Exists(const CURL& url)
+       g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_FTP_FILEMETHOD, CURLFTPMETHOD_NOCWD);
+   }
+ 
+-  CURLcode result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++  CURLcode result = PerformWithTransientRetries(m_state->m_easyHandle, __FUNCTION__);
+ 
+   if (result == CURLE_WRITE_ERROR || result == CURLE_OK)
+   {
+@@ -1439,7 +1603,7 @@ bool CCurlFile::Exists(const CURL& url)
+         list = g_curlInterface.slist_append(list, "Range: bytes=0-1"); /* try to only request 1 byte */
+         g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_HTTPHEADER, list);
+ 
+-        result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++        result = PerformWithTransientRetries(m_state->m_easyHandle, __FUNCTION__);
+         g_curlInterface.slist_free_all(list);
+ 
+         if (result == CURLE_WRITE_ERROR || result == CURLE_OK)
+@@ -1620,7 +1784,7 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
+       g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_FTP_FILEMETHOD, CURLFTPMETHOD_NOCWD);
+   }
+ 
+-  CURLcode result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++  CURLcode result = PerformWithTransientRetries(m_state->m_easyHandle, __FUNCTION__);
+ 
+   if(result == CURLE_HTTP_RETURNED_ERROR)
+   {
+@@ -1651,7 +1815,7 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
+ #endif
+     g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOPROGRESS, 0);
+ 
+-    result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++    result = PerformWithTransientRetries(m_state->m_easyHandle, __FUNCTION__);
+   }
+ 
+   if( result != CURLE_ABORTED_BY_CALLBACK && result != CURLE_OK )
+@@ -1760,6 +1924,9 @@ ssize_t CCurlFile::CReadState::Read(void* lpBuf, size_t uiBufSize)
+ /* use to attempt to fill the read buffer up to requested number of bytes */
+ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
+ {
++  if (!m_multiHandle)
++    return FILLBUFFER_FAIL;
++
+   int retry = 0;
+   fd_set fdread;
+   fd_set fdwrite;
+diff --git a/xbmc/filesystem/DllLibCurl.cpp b/xbmc/filesystem/DllLibCurl.cpp
+index b9a7a653bd..0bc576cfcb 100644
+--- a/xbmc/filesystem/DllLibCurl.cpp
++++ b/xbmc/filesystem/DllLibCurl.cpp
+@@ -12,6 +12,7 @@
+ #include "utils/log.h"
+ 
+ #include <assert.h>
++#include <cstdint>
+ #include <mutex>
+ 
+ namespace XCURL
+@@ -112,14 +113,7 @@ const char* DllLibCurl::easy_strerror(CURLcode code)
+   return curl_easy_strerror(code);
+ }
+ 
+-DllLibCurlGlobal::DllLibCurlGlobal()
+-{
+-  /* we handle this ourself */
+-  if (curl_global_init(CURL_GLOBAL_ALL))
+-  {
+-    CLog::Log(LOGERROR, "Error initializing libcurl");
+-  }
+-}
++DllLibCurlGlobal::DllLibCurlGlobal() = default;
+ 
+ DllLibCurlGlobal::~DllLibCurlGlobal()
+ {
+@@ -133,7 +127,26 @@ DllLibCurlGlobal::~DllLibCurlGlobal()
+       multi_cleanup(session.m_multi);
+   }
+   // close libcurl
+-  curl_global_cleanup();
++  if (m_initialized)
++    curl_global_cleanup();
++}
++
++bool DllLibCurlGlobal::EnsureInit()
++{
++  if (m_initialized)
++    return true;
++
++  /* Do this lazily from the app thread instead of a static constructor:
++   * on PS4 the global constructor can run before the runtime is ready. */
++  const CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
++  CLog::Log(LOGINFO, "Curl: global_init rc={}", static_cast<int>(rc));
++  if (rc != CURLE_OK)
++  {
++    CLog::Log(LOGERROR, "Curl: global_init failed: {}", easy_strerror(rc));
++    return false;
++  }
++  m_initialized = true;
++  return true;
+ }
+ 
+ void DllLibCurlGlobal::CheckIdle()
+@@ -177,6 +190,15 @@ void DllLibCurlGlobal::easy_acquire(const char* protocol,
+ 
+   std::unique_lock lock(m_critSection);
+ 
++  if (!EnsureInit())
++  {
++    if (easy_handle)
++      *easy_handle = nullptr;
++    if (multi_handle)
++      *multi_handle = nullptr;
++    return;
++  }
++
+   for (auto& it : m_sessions)
+   {
+     if (!it.m_busy)
+@@ -199,6 +221,16 @@ void DllLibCurlGlobal::easy_acquire(const char* protocol,
+           if (!it.m_multi)
+             it.m_multi = multi_init();
+ 
++          if (!it.m_multi)
++          {
++            CLog::Log(LOGERROR, "Curl: multi_init failed errno={}", errno);
++            it.m_busy = false;
++            if (easy_handle)
++              *easy_handle = nullptr;
++            *multi_handle = nullptr;
++            return;
++          }
++
+           *multi_handle = it.m_multi;
+         }
+ 
+@@ -221,12 +253,24 @@ void DllLibCurlGlobal::easy_acquire(const char* protocol,
+   if (multi_handle)
+   {
+     session.m_multi = multi_init();
++    if (!session.m_multi)
++    {
++      CLog::Log(LOGERROR, "Curl: multi_init failed errno={}", errno);
++      if (session.m_easy)
++        easy_cleanup(session.m_easy);
++      if (easy_handle)
++        *easy_handle = nullptr;
++      *multi_handle = nullptr;
++      return;
++    }
+     *multi_handle = session.m_multi;
+   }
+ 
+   m_sessions.push_back(session);
+ 
+-  CLog::Log(LOGDEBUG, "{} - Created session to {}://{}", __FUNCTION__, protocol, hostname);
++  CLog::Log(LOGINFO, "Curl: created session {}:// easy=0x{:x} multi=0x{:x}",
++            protocol, reinterpret_cast<uintptr_t>(session.m_easy),
++            reinterpret_cast<uintptr_t>(session.m_multi));
+ }
+ 
+ void DllLibCurlGlobal::easy_release(CURL_HANDLE** easy_handle, CURLM** multi_handle)
+diff --git a/xbmc/filesystem/DllLibCurl.h b/xbmc/filesystem/DllLibCurl.h
+index 760f28defb..8c84a9c3bd 100644
+--- a/xbmc/filesystem/DllLibCurl.h
++++ b/xbmc/filesystem/DllLibCurl.h
+@@ -69,6 +69,7 @@ class DllLibCurlGlobal : public DllLibCurl
+ public:
+   DllLibCurlGlobal();
+   ~DllLibCurlGlobal();
++  bool EnsureInit();
+   /* extend interface with buffered functions */
+   void easy_acquire(const char* protocol,
+                     const char* hostname,
+@@ -100,6 +101,7 @@ public:
+ 
+   VEC_CURLSESSIONS m_sessions;
+   CCriticalSection m_critSection;
++  bool m_initialized{false};
+ };
+ } // namespace XCURL
+ 
+diff --git a/xbmc/filesystem/FileCache.cpp b/xbmc/filesystem/FileCache.cpp
+index b0ad2b5e58..d08542190a 100644
+--- a/xbmc/filesystem/FileCache.cpp
++++ b/xbmc/filesystem/FileCache.cpp
+@@ -149,8 +149,14 @@ bool CFileCache::Open(const CURL& url)
+   if (!settings)
+     return false;
+ 
+-  const unsigned int cacheMemSize =
++  unsigned int cacheMemSize =
+       settings->GetInt(CSettings::SETTING_FILECACHE_MEMORYSIZE) * 1024 * 1024;
++#if defined(__ORBIS__)
++  // The app heap is tight (the addon/GUI already use most of it); a 64 MB
++  // double cache caused a 32 MB allocation failure when opening a video.
++  if (cacheMemSize > 8u * 1024u * 1024u)
++    cacheMemSize = 8u * 1024u * 1024u;
++#endif
+ 
+   m_source->IoControl(IOControl::SET_CACHE, this);
+ 
+diff --git a/xbmc/network/DNSNameCache.cpp b/xbmc/network/DNSNameCache.cpp
+index d4b97871d0..d3a76ada23 100644
+--- a/xbmc/network/DNSNameCache.cpp
++++ b/xbmc/network/DNSNameCache.cpp
+@@ -11,10 +11,12 @@
+ #include "network/Network.h"
+ #include "utils/log.h"
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <mutex>
+ #include <string>
++#include <thread>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -73,15 +75,22 @@ bool IsUnusableForRemoteHost(const addrinfo* info)
+       return true;
+   }
+ }
+-} // unnamed namespace
+ 
+-std::string KODI::NETWORK::SelectDNSAddress(const addrinfo* results)
++/*!
++ * \brief Pick the first usable address of the requested family.
++ *
++ * The PS4 has no usable IPv6 route but resolvers still return AAAA records.
++ * Feeding such an address to CURLOPT_RESOLVE forces curl to connect to it and
++ * every request fails, so IPv4 has to win when both families are present.
++ */
++std::string PickAddress(const addrinfo* results, int family)
+ {
+-  // take the first address that can reach a remote host, but keep an unreachable one as a
+-  // fallback so that a name which only resolves to loopback, e.g. "localhost", still works
+   std::string fallback;
+   for (const addrinfo* info = results; info; info = info->ai_next)
+   {
++    if (family != AF_UNSPEC && info->ai_family != family)
++      continue;
++
+     std::string address = CNetworkBase::GetIpStr(info->ai_addr);
+     if (address.empty())
+       continue;
+@@ -98,6 +107,30 @@ std::string KODI::NETWORK::SelectDNSAddress(const addrinfo* results)
+ 
+   return fallback;
+ }
++} // unnamed namespace
++
++bool IsTransientDNSError(int rc)
++{
++  if (rc == EAI_AGAIN || rc == EAI_FAIL)
++    return true;
++#ifdef EAI_SYSTEM
++  if (rc == EAI_SYSTEM)
++    return true;
++#endif
++  return false;
++}
++
++std::string KODI::NETWORK::SelectDNSAddress(const addrinfo* results)
++{
++  // take the first address that can reach a remote host, but keep an unreachable one as a
++  // fallback so that a name which only resolves to loopback, e.g. "localhost", still works
++  std::string address = PickAddress(results, AF_INET);
++  if (!address.empty())
++    return address;
++
++  address = PickAddress(results, AF_UNSPEC);
++  return address;
++}
+ 
+ bool CDNSNameCache::Lookup(const std::string& strHostName, std::string& strIpAddress)
+ {
+@@ -120,30 +153,103 @@ bool CDNSNameCache::Lookup(const std::string& strHostName, std::string& strIpAdd
+   if (GetCached(strHostName, strIpAddress))
+     return true;
+ 
+-  // perform dns lookup
+-  addrinfo hints{};
+-  addrinfo* res;
++  /* steady_clock does not advance on Orbis (every measurement reads 0 ms), so
++   * use the wall clock for the retry budget and the log timings. */
++  const auto lookupStart = std::chrono::system_clock::now();
++  int lastErrno = 0;
++  int totalAttempts = 0;
++  int rc = EAI_FAIL;
++  addrinfo* res = nullptr;
++
++  const auto tryLookup = [&](int family, int flags, int attempts) -> int
++  {
++    addrinfo hints{};
++    hints.ai_family = family;
++    hints.ai_socktype = SOCK_STREAM;
++    hints.ai_flags = AI_CANONNAME | flags;
++
++    int last = EAI_FAIL;
++    for (int attempt = 0; attempt < attempts; ++attempt)
++    {
++      res = nullptr;
++      errno = 0;
++      ++totalAttempts;
++      const auto attemptStart = std::chrono::system_clock::now();
++      last = getaddrinfo(strHostName.c_str(), nullptr, &hints, &res);
++      const int savedErrno = errno;
++      const auto attemptMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                 std::chrono::system_clock::now() - attemptStart)
++                                 .count();
++      if (last == 0 || !IsTransientDNSError(last))
++      {
++        lastErrno = savedErrno;
++        return last;
++      }
++
++      lastErrno = savedErrno;
++      CLog::Log(LOGDEBUG,
++                "DNS lookup returned rc={} errno={} after {} ms (attempt {}/{}), retrying", last,
++                savedErrno, attemptMs, attempt + 1, attempts);
++
++#ifdef EPROTONOSUPPORT
++      /* Orbis rejects the socket flags used by musl's AI_ADDRCONFIG probe with
++       * EPROTONOSUPPORT.  Retrying the same family cannot succeed; go straight
++       * to the IPv4 pass without AI_ADDRCONFIG. */
++      if (last == EAI_SYSTEM && savedErrno == EPROTONOSUPPORT)
++        break;
++#endif
++
++      /* A slow failure means the resolver is reachable but timing out.  Piling
++       * up more attempts only freezes the caller: give up and let the next
++       * request (or the caller) decide.  Fast failures (EAI_SYSTEM with the
++       * Wi-Fi link settling) are the ones worth retrying. */
++      if (attemptMs > 1000)
++        break;
++
++      std::this_thread::sleep_for(std::chrono::milliseconds(150 * (attempt + 1)));
++    }
++    return last;
++  };
++
++  // First try the normal resolver.  If it fails transiently, retry IPv4
++  // without AI_ADDRCONFIG: the PS4 has no usable IPv6 route and the resolver
++  // can return EAI_SYSTEM/EAI_FAIL while the Wi-Fi link is settling.
++  int firstFlags = 0;
++#ifdef AI_ADDRCONFIG
++  firstFlags = AI_ADDRCONFIG;
++#endif
++  rc = tryLookup(AF_UNSPEC, firstFlags, 5);
++  if (rc != 0)
++    rc = tryLookup(AF_INET, 0, 3);
+ 
+-  hints.ai_family = AF_UNSPEC;
+-  hints.ai_socktype = SOCK_STREAM;
+-  hints.ai_flags |= AI_CANONNAME;
++  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++                             std::chrono::system_clock::now() - lookupStart)
++                             .count();
+ 
+-  if (getaddrinfo(strHostName.c_str(), nullptr, &hints, &res) == 0)
++  if (rc == 0)
+   {
+     strIpAddress = KODI::NETWORK::SelectDNSAddress(res);
+     freeaddrinfo(res);
+ 
+     if (!strIpAddress.empty())
+     {
++      if (totalAttempts > 1)
++        CLog::Log(LOGINFO, "DNS lookup recovered after {} attempts in {} ms", totalAttempts,
++                  elapsedMs);
+       Add(strHostName, strIpAddress);
+       return true;
+     }
+   }
++  else
++  {
++    CLog::Log(LOGERROR, "Unable to lookup host (rc={} {}, errno={} {}, {} attempts, {} ms)",
++              rc, gai_strerror(rc), lastErrno, strerror(lastErrno), totalAttempts, elapsedMs);
++    return false;
++  }
+ 
+-  CLog::Log(LOGERROR, "Unable to lookup host: '{}'", strHostName);
++  CLog::Log(LOGERROR, "Unable to lookup host");
+   return false;
+ }
+-
+ bool CDNSNameCache::GetCached(const std::string& strHostName, std::string& strIpAddress) const
+ {
+   std::lock_guard lock(m_critical);
+diff --git a/xbmc/network/UdpClient.cpp b/xbmc/network/UdpClient.cpp
+index 4f6d0d439d..89da4cdaf3 100644
+--- a/xbmc/network/UdpClient.cpp
++++ b/xbmc/network/UdpClient.cpp
+@@ -11,6 +11,12 @@
+ #include <mutex>
+ #ifdef TARGET_POSIX
+ #include <sys/ioctl.h>
++#ifndef FIONBIO
++#define FIONBIO _IOW('f', 126, int)
++#endif
++#ifndef FIONREAD
++#define FIONREAD _IOR('f', 127, int)
++#endif
+ #endif
+ #include "Network.h"
+ #include "utils/TimeUtils.h"
+diff --git a/xbmc/platform/ps4/network/CMakeLists.txt b/xbmc/platform/ps4/network/CMakeLists.txt
+new file mode 100644
+index 0000000000..25d8ee87c9
+--- /dev/null
++++ b/xbmc/platform/ps4/network/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(SOURCES NetworkFreebsd.cpp)
++set(HEADERS NetworkFreebsd.h)
++
++core_add_library(platform_freebsd_network)
+diff --git a/xbmc/platform/ps4/network/NetworkFreebsd.cpp b/xbmc/platform/ps4/network/NetworkFreebsd.cpp
+new file mode 100644
+index 0000000000..095585da75
+--- /dev/null
++++ b/xbmc/platform/ps4/network/NetworkFreebsd.cpp
+@@ -0,0 +1,388 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "NetworkFreebsd.h"
++
++#include "platform/ps4/PS4HardwareProfile.h"
++#include "utils/StringUtils.h"
++#include "utils/log.h"
++
++#include <array>
++#include <cstring>
++#include <errno.h>
++
++#if defined(__ORBIS__)
++#include <orbis/Net.h>
++#endif
++
++#include <arpa/inet.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <net/if_arp.h>
++#if !defined(__ORBIS__)
++#include <net/if_dl.h>
++#endif
++#include <net/route.h>
++#include <netinet/if_ether.h>
++#include <netinet/in.h>
++#include <resolv.h>
++#if !defined(__ORBIS__)
++#include <sys/sockio.h>
++#endif
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++CNetworkInterfaceFreebsd::CNetworkInterfaceFreebsd(CNetworkPosix* network,
++                                                   std::string interfaceName,
++                                                   char interfaceMacAddrRaw[6])
++  : CNetworkInterfacePosix(network, interfaceName, interfaceMacAddrRaw)
++{
++}
++
++bool CNetworkInterfaceFreebsd::IsEnabled() const
++{
++#if defined(__ORBIS__)
++  return m_ps4Address != 0;
++#else
++  return CNetworkInterfacePosix::IsEnabled();
++#endif
++}
++
++bool CNetworkInterfaceFreebsd::IsConnected() const
++{
++#if defined(__ORBIS__)
++  return m_ps4Address != 0;
++#else
++  return CNetworkInterfacePosix::IsConnected();
++#endif
++}
++
++std::string CNetworkInterfaceFreebsd::GetCurrentIPAddress() const
++{
++#if defined(__ORBIS__)
++  if (m_ps4Address != 0)
++  {
++    struct in_addr address = {};
++    address.s_addr = m_ps4Address;
++    return inet_ntoa(address);
++  }
++#endif
++  return CNetworkInterfacePosix::GetCurrentIPAddress();
++}
++
++std::string CNetworkInterfaceFreebsd::GetCurrentNetmask() const
++{
++#if defined(__ORBIS__)
++  if (m_ps4Netmask != 0)
++  {
++    struct in_addr address = {};
++    address.s_addr = m_ps4Netmask;
++    return inet_ntoa(address);
++  }
++#endif
++  return CNetworkInterfacePosix::GetCurrentNetmask();
++}
++
++std::string CNetworkInterfaceFreebsd::GetCurrentDefaultGateway() const
++{
++#if defined(__ORBIS__)
++  const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++  return profile.netGateway;
++#else
++  std::string result;
++
++  size_t needed;
++  int mib[6];
++  char *buf, *next, *lim;
++  char line[16];
++  struct rt_msghdr* rtm;
++  struct sockaddr* sa;
++  struct sockaddr_in* sockin;
++
++  mib[0] = CTL_NET;
++  mib[1] = PF_ROUTE;
++  mib[2] = 0;
++  mib[3] = 0;
++  mib[4] = NET_RT_DUMP;
++  mib[5] = 0;
++  if (sysctl(mib, 6, NULL, &needed, NULL, 0) < 0)
++    return result;
++
++  if ((buf = (char*)malloc(needed)) == NULL)
++    return result;
++
++  if (sysctl(mib, 6, buf, &needed, NULL, 0) < 0)
++  {
++    free(buf);
++    return result;
++  }
++
++  lim = buf + needed;
++  for (next = buf; next < lim; next += rtm->rtm_msglen)
++  {
++    rtm = (struct rt_msghdr*)next;
++    sa = (struct sockaddr*)(rtm + 1);
++    sa = (struct sockaddr*)(SA_SIZE(sa) + (char*)sa);
++    sockin = (struct sockaddr_in*)sa;
++    if (inet_ntop(AF_INET, &sockin->sin_addr.s_addr, line, sizeof(line)) == NULL)
++    {
++      free(buf);
++      return result;
++    }
++    result = line;
++    break;
++  }
++  free(buf);
++
++  return result;
++#endif
++}
++
++bool CNetworkInterfaceFreebsd::GetHostMacAddress(unsigned long host_ip, std::string& mac) const
++{
++#if defined(__ORBIS__)
++  (void)host_ip;
++  mac.clear();
++  return false;
++#else
++  bool ret = false;
++  size_t needed;
++  char *buf, *next;
++  struct rt_msghdr* rtm;
++  struct sockaddr_inarp* sin;
++  struct sockaddr_dl* sdl;
++  constexpr std::array<int, 6> mib = {
++      CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO,
++  };
++
++  mac = "";
++
++  if (sysctl(mib.data(), mib.size(), nullptr, &needed, nullptr, 0) == 0)
++  {
++    buf = (char*)malloc(needed);
++    if (buf)
++    {
++      if (sysctl(mib.data(), mib.size(), buf, &needed, nullptr, 0) == 0)
++      {
++        for (next = buf; next < buf + needed; next += rtm->rtm_msglen)
++        {
++
++          rtm = (struct rt_msghdr*)next;
++          sin = (struct sockaddr_inarp*)(rtm + 1);
++          sdl = (struct sockaddr_dl*)(sin + 1);
++
++          if (host_ip != sin->sin_addr.s_addr || sdl->sdl_alen < 6)
++            continue;
++
++          u_char* cp = (u_char*)LLADDR(sdl);
++
++          mac = StringUtils::Format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", cp[0], cp[1],
++                                    cp[2], cp[3], cp[4], cp[5]);
++          ret = true;
++          break;
++        }
++      }
++      free(buf);
++    }
++  }
++  return ret;
++#endif
++}
++
++std::unique_ptr<CNetworkBase> CNetworkBase::GetNetwork()
++{
++  return std::make_unique<CNetworkFreebsd>();
++}
++
++CNetworkFreebsd::CNetworkFreebsd() : CNetworkPosix()
++{
++  queryInterfaceList();
++}
++
++void CNetworkFreebsd::GetMacAddress(const std::string& interfaceName, char rawMac[6])
++{
++  memset(rawMac, 0, 6);
++
++#if defined(__ORBIS__)
++  // PS4's ioctl(SIOCGIFHWADDR) can block during startup; try the native API
++  // first and fall back to the ioctl only if it fails.
++  (void)interfaceName;
++  OrbisNetEtherAddr ether = {};
++  if (sceNetGetMacAddress(&ether, sizeof(ether)) == 0)
++  {
++    memcpy(rawMac, ether.data, 6);
++  }
++  else
++  {
++    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
++    if (sock >= 0)
++    {
++      struct ifreq ifr = {};
++      strncpy(ifr.ifr_name, interfaceName.c_str(), IFNAMSIZ - 1);
++      if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0)
++        memcpy(rawMac, ifr.ifr_hwaddr.sa_data, 6);
++      close(sock);
++    }
++  }
++#else
++#if !defined(IFT_ETHER)
++#define IFT_ETHER 0x6 /* Ethernet CSMACD */
++#endif
++  const struct sockaddr_dl* dlAddr = NULL;
++  const uint8_t* base = NULL;
++  // Query the list of interfaces.
++  struct ifaddrs* list;
++  struct ifaddrs* interface;
++
++  if (getifaddrs(&list) < 0)
++  {
++    return;
++  }
++
++  for (interface = list; interface != NULL; interface = interface->ifa_next)
++  {
++    if (interfaceName == interface->ifa_name)
++    {
++      if ((interface->ifa_addr->sa_family == AF_LINK) &&
++          (((const struct sockaddr_dl*)interface->ifa_addr)->sdl_type == IFT_ETHER))
++      {
++        dlAddr = (const struct sockaddr_dl*)interface->ifa_addr;
++        base = (const uint8_t*)&dlAddr->sdl_data[dlAddr->sdl_nlen];
++
++        if (dlAddr->sdl_alen > 5)
++        {
++          memcpy(rawMac, base, 6);
++        }
++      }
++      break;
++    }
++  }
++
++  freeifaddrs(list);
++#endif
++}
++
++void CNetworkFreebsd::queryInterfaceList()
++{
++  char macAddrRaw[6];
++  m_interfaces.clear();
++
++  // Query the list of interfaces.
++  struct ifaddrs* list = nullptr;
++  if (getifaddrs(&list) < 0)
++  {
++    // getifaddrs() is empty on some PS4 firmware revisions.  NetCtl is
++    // initialised before the network service is created, so fall back to
++    // the address reported by the system.
++    const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++    if (profile.netValid && !profile.netIp.empty())
++    {
++      char macAddrRawFallback[6] = {};
++      const std::string ifName = profile.netInterface.empty() ? "eth0" : profile.netInterface;
++      GetMacAddress(ifName, macAddrRawFallback);
++      auto* iface = new CNetworkInterfaceFreebsd(this, ifName, macAddrRawFallback);
++      iface->SetPS4Address(inet_addr(profile.netIp.c_str()));
++      iface->SetPS4Netmask(inet_addr(profile.netMask.c_str()));
++      m_interfaces.push_back(iface);
++      CLog::Log(LOGINFO, "PS4 network: netctl interface {}", ifName);
++    }
++    return;
++  }
++
++  struct ifaddrs* cur;
++  for (cur = list; cur != NULL; cur = cur->ifa_next)
++  {
++    if (!cur->ifa_addr || cur->ifa_addr->sa_family != AF_INET)
++      continue;
++
++    const auto* address = reinterpret_cast<const struct sockaddr_in*>(cur->ifa_addr);
++    if (address->sin_addr.s_addr == 0 || address->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
++      continue;
++
++    GetMacAddress(cur->ifa_name, macAddrRaw);
++    auto* iface = new CNetworkInterfaceFreebsd(this, cur->ifa_name, macAddrRaw);
++    iface->SetPS4Address(address->sin_addr.s_addr);
++    if (cur->ifa_netmask && cur->ifa_netmask->sa_family == AF_INET)
++    {
++      const auto* netmask = reinterpret_cast<const struct sockaddr_in*>(cur->ifa_netmask);
++      iface->SetPS4Netmask(netmask->sin_addr.s_addr);
++    }
++    m_interfaces.push_back(iface);
++
++    CLog::Log(LOGINFO, "PS4 network: interface {}", cur->ifa_name);
++  }
++
++  freeifaddrs(list);
++
++  if (m_interfaces.empty())
++  {
++    const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++    if (profile.netValid && !profile.netIp.empty())
++    {
++      char macAddrRawFallback[6] = {};
++      const std::string ifName = profile.netInterface.empty() ? "eth0" : profile.netInterface;
++      GetMacAddress(ifName, macAddrRawFallback);
++      auto* iface = new CNetworkInterfaceFreebsd(this, ifName, macAddrRawFallback);
++      iface->SetPS4Address(inet_addr(profile.netIp.c_str()));
++      iface->SetPS4Netmask(inet_addr(profile.netMask.c_str()));
++      m_interfaces.push_back(iface);
++      CLog::Log(LOGINFO, "PS4 network: netctl interface {}", ifName);
++    }
++  }
++}
++
++std::vector<std::string> CNetworkFreebsd::GetNameServers()
++{
++  std::vector<std::string> result;
++
++  res_init();
++
++  for (int i = 0; i < _res.nscount; i++)
++  {
++    std::string ns = inet_ntoa(_res.nsaddr_list[i].sin_addr);
++    result.push_back(ns);
++  }
++
++  if (result.empty())
++  {
++    const auto& profile = KODI::PLATFORM::PS4::GetHardwareProfile();
++    if (!profile.netDns1.empty())
++      result.push_back(profile.netDns1);
++    if (!profile.netDns2.empty())
++      result.push_back(profile.netDns2);
++  }
++
++  return result;
++}
++
++bool CNetworkFreebsd::PingHost(unsigned long remote_ip, unsigned int timeout_ms)
++{
++  char cmd_line[64];
++
++  struct in_addr host_ip;
++  host_ip.s_addr = remote_ip;
++
++  snprintf(cmd_line, sizeof(cmd_line), "ping -c 1 -t %d %s",
++           timeout_ms / 1000 + (timeout_ms % 1000) != 0, inet_ntoa(host_ip));
++
++  int status = -1;
++  status = system(cmd_line);
++  int result = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
++
++  // http://linux.about.com/od/commands/l/blcmdl8_ping.htm ;
++  // 0 reply
++  // 1 no reply
++  // else some error
++
++  if (result < 0 || result > 1)
++    CLog::Log(LOGERROR, "Ping fail : status = {}, errno = {} : '{}'", status, errno, cmd_line);
++
++  return result == 0;
++}
+diff --git a/xbmc/platform/ps4/network/NetworkFreebsd.h b/xbmc/platform/ps4/network/NetworkFreebsd.h
+new file mode 100644
+index 0000000000..df121232e1
+--- /dev/null
++++ b/xbmc/platform/ps4/network/NetworkFreebsd.h
+@@ -0,0 +1,52 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "platform/posix/network/NetworkPosix.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++class CNetworkInterfaceFreebsd : public CNetworkInterfacePosix
++{
++public:
++  CNetworkInterfaceFreebsd(CNetworkPosix* network,
++                           std::string interfaceName,
++                           char interfaceMacAddrRaw[6]);
++  ~CNetworkInterfaceFreebsd() override = default;
++
++  void SetPS4Address(std::uint32_t address) { m_ps4Address = address; }
++  void SetPS4Netmask(std::uint32_t netmask) { m_ps4Netmask = netmask; }
++
++  bool IsEnabled() const override;
++  bool IsConnected() const override;
++  std::string GetCurrentIPAddress() const override;
++  std::string GetCurrentNetmask() const override;
++  std::string GetCurrentDefaultGateway() const override;
++  bool GetHostMacAddress(unsigned long host, std::string& mac) const override;
++
++private:
++  std::uint32_t m_ps4Address = 0;
++  std::uint32_t m_ps4Netmask = 0;
++};
++
++class CNetworkFreebsd : public CNetworkPosix
++{
++public:
++  CNetworkFreebsd();
++  ~CNetworkFreebsd() override = default;
++
++  bool PingHost(unsigned long host, unsigned int timeout_ms = 2000) override;
++  std::vector<std::string> GetNameServers() override;
++
++private:
++  void GetMacAddress(const std::string& interfaceName, char macAddrRaw[6]) override;
++  void queryInterfaceList() override;
++};
