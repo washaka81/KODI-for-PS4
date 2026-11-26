@@ -18,9 +18,8 @@
 - A/V startup anchors the clock to the audio actually in flight.
   `GENERAL_RESYNC` is about -30 ms and the initial ActiveAE error is in
   the tens of milliseconds instead of the previous +941.9 ms.
-- Live playback uses audio-master clock feedback. A rebuffer watchdog
-  flushes audio/video and re-runs the start sync when the presented video
-  falls more than 2 s behind the clock (30 s cooldown).
+- Live playback uses audio-master clock feedback; the periodic ±1 s
+  resampler oscillation is removed.
 - Native `libSceHttp`/`libSceSsl` HTTP(S) transport for FFmpeg; Curl keeps
   OpenSSL for M3U, EPG and add-on traffic.
 - `pvr.iptvsimple` 22.6.5 (PVR API 9.2.0) is packaged and usable.
@@ -39,5 +38,8 @@
   display, the 10-bit swapchain and BT.2020/PQ metadata are all available;
   otherwise Kodi tone-maps to SDR.
 - Full coverage of binary and Python add-ons is still in progress.
+- A rebuffer watchdog is implemented (flush plus start sync, 30 s
+  cooldown), but it has not yet been exercised with a deliberate live
+  stall.
 - The release series does not include the latest validated changes yet;
   `0.1.2-alpha1` is built from the development series.

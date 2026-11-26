@@ -23,8 +23,10 @@ reviewable.
   854x480 (SD/BT.601) and 1080p streams render through the same YUV2RGB
   image path at ~59.9 fps. The live SD/BT.601 case is validated end to end.
 - Audio is stereo PCM through `sceAudioOut`. Live streams use the audio
-  clock as the A/V master (clock feedback); startup and rebuffer recovery
-  are handled without the previous ~1 s resampler oscillation.
+  clock as the A/V master (clock feedback); startup is anchored to the
+  audio in flight and the previous ~1 s resampler oscillation is gone. A
+  rebuffer watchdog is implemented; its deliberate live-stall test is
+  still pending.
 - Network works: native `libSceHttp`/`libSceSsl` transport for FFmpeg
   HTTP(S) (HLS, DASH, MP4, MPEG-TS); Curl keeps OpenSSL for M3U, logos,
   EPG and addons. The native client is the one accepted by the live CDN

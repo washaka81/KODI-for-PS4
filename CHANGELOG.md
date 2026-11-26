@@ -24,10 +24,11 @@ official release; the current base is Kodi 22.0 RC2 Piers
 - Native `libSceHttp`/`libSceSsl` transport for FFmpeg, Videodec2 hardware
   H.264 decode, PVR IPTV Simple, embedded CPython 3.14 and the packaged
   add-on launcher.
-- Pending: exact linear BT.601→BT.709 primaries conversion, memory
-  pressure under the 395-channel workload, 4K/HDR output and full add-on
-  coverage. The release series does not include these changes yet; this
-  alpha is built from the development series.
+- Pending: a deliberate live-stall test of the rebuffer watchdog, exact
+  linear BT.601→BT.709 primaries conversion, memory pressure under the
+  395-channel workload, 4K/HDR output and full add-on coverage. The
+  release series does not include these changes yet; this alpha is built
+  from the development series.
 
 ## 0.1.1 (2026-11-14)
 
