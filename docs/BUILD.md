@@ -64,6 +64,14 @@ The default build tree is `build/kodi-ps4`; an existing
 `build/kodi-ps4-openssl` tree is preferred for the external-FFmpeg setup
 used by the current packages. Build outputs and `dist/` are ignored by git.
 
+The validated live packages use the external-FFmpeg tree
+(`ENABLE_INTERNAL_FFMPEG=OFF`, `DEPS_PS4=$HOME/kodi-deps-ps4-openssl`).
+An internal-FFmpeg tree does not contain the `ps4http` protocol or the
+`h264_videodec2` decoder; a package built from it can play local video
+with software decoding but cannot validate HLS/live playback. Keep the
+external tree for console validation until the build script has a
+dedicated external-FFmpeg option.
+
 ## Dependencies
 
 The dependency setup is idempotent and lives outside the repository under
